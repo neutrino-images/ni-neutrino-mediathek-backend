@@ -2,6 +2,9 @@
 #ifndef __SQL_H__
 #define __SQL_H__
 
+/* Upper bound for "limit" in listVideos requests */
+#define LIST_VIDEO_MAX_LIMIT 1000
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>

@@ -179,6 +179,17 @@ bool CSql::sqlListVideo(cmdListVideo_t* clv, listVideoHead_t* lvh, vector<listVi
 	if (mysqlCon == NULL)
 		return false;
 
+	/* Limit and offset come straight from the client. Without bounds a
+	 * single request (e.g. channel '%', epoch -1, huge limit) dumps the
+	 * whole video table as JSON; negative values break the query.
+	 * The plugin pages with at most 1000 entries per request. */
+	if (clv->limit > LIST_VIDEO_MAX_LIMIT)
+		clv->limit = LIST_VIDEO_MAX_LIMIT;
+	if (clv->limit < 0)
+		clv->limit = 0;
+	if (clv->start < 0)
+		clv->start = 0;
+
 	time_t now      = (clv->refTime == 0) ? time(0) : clv->refTime;
 	time_t fromTime = 0;
 	time_t toTime   = 0;
