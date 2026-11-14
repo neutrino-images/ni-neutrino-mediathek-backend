@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <strings.h>
 #include <unistd.h>
 #include <math.h>
 
@@ -90,28 +91,25 @@ int CCurl::CurlProgressFunc_old(void *p, double dltotal, double dlnow, double ul
 
 size_t CCurl::CurlGetContentLengthFunc(void *ptr, size_t size, size_t nmemb, void *stream)
 {
-	int r;
+	/* The header line comes from the server and is not NUL-terminated.
+	 * Work on a bounded copy; header names are case-insensitive. */
+	size_t n = size * nmemb;
+	string line((const char*)ptr, n);
 	long len = 0;
-	char buf[1024];
-	memset(buf, 0, sizeof(buf));
-	r = sscanf((const char*)ptr, "Content-Range: bytes %s1023\n", buf);
-	if (r) {
-		char *pch;
-		pch = strrchr(buf,'/');
-		if (pch) {
-			pch++;
-			if (pch)
-				len = atol(pch);
-		}
+
+	if (strncasecmp(line.c_str(), "Content-Range:", 14) == 0) {
+		/* Content-Range: bytes 0-8191/123456 */
+		size_t slash = line.rfind('/');
+		if (slash != string::npos)
+			len = atol(line.c_str() + slash + 1);
 		*((long*) stream) = len;
 	}
-	else {
-		r = sscanf((const char*)ptr, "Content-Length: %ld\n", &len);
-		if (r)
-			*((long*) stream) = len;
+	else if (strncasecmp(line.c_str(), "Content-Length:", 15) == 0) {
+		len = atol(line.c_str() + 15);
+		*((long*) stream) = len;
 	}
 
-	return size * nmemb;
+	return n;
 }
 
 int CCurl::CurlDownload(string url,
