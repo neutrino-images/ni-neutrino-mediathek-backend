@@ -202,7 +202,11 @@ int CCurl::CurlDownload(string url,
 	curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT, (long)(4*connectTimeout));
 	curl_easy_setopt(curl_handle, CURLOPT_CONNECTTIMEOUT, (long)connectTimeout);
 	curl_easy_setopt(curl_handle, CURLOPT_NOSIGNAL, 1L);
-	curl_easy_setopt(curl_handle, CURLOPT_SSL_VERIFYPEER, 0L);
+	/* Verify the server certificate and host name. Without this, anyone
+	 * between us and the download server could hand us a forged server
+	 * list or film list. */
+	curl_easy_setopt(curl_handle, CURLOPT_SSL_VERIFYPEER, 1L);
+	curl_easy_setopt(curl_handle, CURLOPT_SSL_VERIFYHOST, 2L);
 	/* enable all supported built-in compressions */
 	curl_easy_setopt(curl_handle, CURLOPT_ACCEPT_ENCODING, "");
 	curl_easy_setopt(curl_handle, CURLOPT_COOKIE, "");
