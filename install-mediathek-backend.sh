@@ -226,19 +226,38 @@ apache_files_differ() {  # $1 = Vergleichsverzeichnis (Sicherung)
 }
 
 do_check() {
-  echo "Installiert: $(cat "$VERSION_FILE" 2>/dev/null || echo 'noch nicht installiert')"
-  [ -d "$REPO_DIR/.git" ] || { echo "Repo noch nicht geklont ($REPO_DIR)"; return 0; }
+  # Installierte Version und Zusatzangaben (repo=…, script=…) getrennt
+  local inst_ver="noch nicht installiert" inst_rest=""
+  if [ -f "$VERSION_FILE" ]; then
+    inst_ver="$(sed -n 's/.*version=\([^ ]*\).*/\1/p' "$VERSION_FILE")"
+    inst_rest="$(sed 's/version=[^ ]* *//; s/ /, /g' "$VERSION_FILE")"
+  fi
+  if [ ! -d "$REPO_DIR/.git" ]; then
+    printf '%-13s %s\n' "Installiert:" "$inst_ver${inst_rest:+  ($inst_rest)}"
+    echo "Repo noch nicht geklont ($REPO_DIR)"; return 0
+  fi
   as_svc git -C "$REPO_DIR" fetch -q --tags origin
-  local latest_tag
+  local latest_tag repo_ver w
   latest_tag="$(as_svc git -C "$REPO_DIR" describe --tags --match 'NI-*' --abbrev=0 origin/HEAD 2>/dev/null || true)"
-  echo "Im Repo:     $(build_version origin/HEAD) (neuester Stand)${latest_tag:+, letzte Freigabe $latest_tag}"
+  repo_ver="$(build_version origin/HEAD)"
+  # Versionen untereinander, Zusatzangaben in einer gemeinsamen Spalte dahinter
+  w=${#inst_ver}; [ ${#repo_ver} -gt "$w" ] && w=${#repo_ver}
+  { printf '%-13s %-*s  %s\n' "Installiert:" "$w" "$inst_ver" "${inst_rest:+($inst_rest)}"
+    printf '%-13s %-*s  %s\n' "Im Repo:" "$w" "$repo_ver" "(neuester Stand${latest_tag:+, letzte Freigabe $latest_tag})"
+  } | sed 's/ *$//'
   # Vergleichsbasis ist der installierte Commit aus der Versionsdatei, nicht der
   # Quellbaum (der kann nach einem abgebrochenen Lauf auf einem anderen Stand sein).
   local base
-  base="$(sed -n 's/.*repo=\([0-9a-f]*\).*/\1/p' "$VERSION_FILE" 2>/dev/null)"
+  base="$(sed -n 's/.*repo=\([0-9a-f]*\).*/\1/p' "$VERSION_FILE" 2>/dev/null || true)"
   [ -n "$base" ] || { echo "Noch nichts installiert – Vergleich entfällt."; return 0; }
   echo "== neu seit dem installierten Stand ($base):"
-  as_svc git -C "$REPO_DIR" log --oneline --decorate=short "$base..origin/HEAD" | sed 's/^/   /'
+  local new_commits
+  new_commits="$(as_svc git -C "$REPO_DIR" log --oneline --decorate=short "$base..origin/HEAD")"
+  if [ -n "$new_commits" ]; then
+    printf '%s\n' "$new_commits" | sed 's/^/   /'
+  else
+    echo "   nichts Neues"
+  fi
   local dd="mediathek-db-import/docker mediathek-api-dev/docker"
   # shellcheck disable=SC2086
   if ! as_svc git -C "$REPO_DIR" diff --quiet "$base" origin/HEAD -- $dd; then
