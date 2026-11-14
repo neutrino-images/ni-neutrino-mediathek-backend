@@ -11,7 +11,7 @@
 #   Internet (https)
 #      |
 #      v
-#   Apache (/mt-api/...)
+#   Apache (mt-api.neutrino-images.de bzw. /mt-api/... der Hauptseite)
 #      |
 #      v
 #   lighttpd (127.0.0.1:18080)
@@ -55,6 +55,9 @@
 #   IMPORT_USER=mt_import / IMPORT_PW=...   DB-Benutzer des Importers
 #   API_USER=mt_api       / API_PW=...      DB-Benutzer der API (nur lesend)
 #   APACHE=1              Apache-Anbindung vorbereiten (0 = weglassen)
+#   API_DOMAIN=mt-api.neutrino-images.de
+#                         eigene Subdomain für die API (leer = keine; dann nur
+#                         /mt-api im vHost der Hauptseite)
 #   QOS=1                 Begrenzung mit mod_qos einrichten (0 = weglassen)
 #   QOS_PER_IP=300        max. API-Anfragen pro IP und Minute (mod_qos)
 #   QOS_CONCURRENT=30     max. gleichzeitige API-Anfragen insgesamt (mod_qos)
@@ -86,6 +89,8 @@ DB_HOST="${DB_HOST:-localhost}"
 IMPORT_USER="${IMPORT_USER:-mt_import}"
 API_USER="${API_USER:-mt_api}"
 APACHE="${APACHE:-1}"
+API_DOMAIN="${API_DOMAIN-mt-api.neutrino-images.de}"
+ACME_ROOT="/var/www/mediathek-api"   # Document-Root der Subdomain (leer, Let's-Encrypt-Prüfdateien)
 QOS="${QOS:-1}"
 QOS_PER_IP="${QOS_PER_IP:-300}"
 QOS_CONCURRENT="${QOS_CONCURRENT:-30}"
@@ -118,6 +123,7 @@ MANAGED_PATHS=(
   /etc/systemd/system/mediathek-importer-full.service
   /etc/logrotate.d/mediathek-api
   /etc/apache2/mediathek-api.inc
+  /etc/apache2/sites-available/mediathek-api.conf
   /etc/apache2/conf-available/mediathek-api-qos.conf
   "$VERSION_FILE"
 )
@@ -166,6 +172,7 @@ build_version() {
 
 # Werte landen in SQL-Befehlen und Passwortdateien: nur harmlose Zeichen zulassen
 check_credentials() {
+  case "$API_DOMAIN" in *[!a-z0-9.-]*) die "API_DOMAIN darf nur Kleinbuchstaben, Ziffern, Punkt und Bindestrich enthalten.";; esac
   local v
   for v in "$IMPORT_USER" "$API_USER" "$IMPORT_PW" "$API_PW"; do
     case "$v" in ''|*[!A-Za-z0-9._-]*) die "Benutzernamen und Passwörter dürfen nur A-Z, a-z, 0-9, Punkt, Unterstrich und Bindestrich enthalten.";; esac
@@ -211,7 +218,7 @@ importer_running() {
 
 apache_files_differ() {  # $1 = Vergleichsverzeichnis (Sicherung)
   local f
-  for f in /etc/apache2/mediathek-api.inc /etc/apache2/conf-available/mediathek-api-qos.conf; do
+  for f in /etc/apache2/mediathek-api.inc /etc/apache2/sites-available/mediathek-api.conf /etc/apache2/conf-available/mediathek-api-qos.conf; do
     [ -e "$1$f" ] || [ -e "$f" ] || continue
     cmp -s "$1$f" "$f" || return 0
   done
@@ -739,15 +746,83 @@ ProxyPassMatch "^/mt-api/(api/(info|listChannels|listLivestream)|api\\.html)\$" 
 </LocationMatch>
 EOF
 
+  if [ -n "$API_DOMAIN" ]; then
+    LE_DIR="/etc/letsencrypt/live/$API_DOMAIN"
+    install -d -m 755 "$ACME_ROOT"
+    cat > /etc/apache2/sites-available/mediathek-api.conf <<EOF
+# Eigene Subdomain für die Mediathek-API: https://$API_DOMAIN
+# (Basis-URL im Plugin, ohne /mt-api)
+#
+# Port 80:  liefert nur die Let's-Encrypt-Prüfdateien aus $ACME_ROOT,
+#           alles andere wird auf HTTPS umgeleitet.
+# Port 443: wird erst aktiv, wenn das Zertifikat unter $LE_DIR liegt.
+#           Ausstellen: certbot certonly --webroot -w $ACME_ROOT -d $API_DOMAIN
+#           --deploy-hook "systemctl reload apache2"
+<VirtualHost *:80>
+	ServerName $API_DOMAIN
+	DocumentRoot $ACME_ROOT
+	<Directory $ACME_ROOT>
+		Options None
+		AllowOverride None
+		Require all granted
+	</Directory>
+	RedirectMatch permanent "^/(?!\.well-known/acme-challenge/)(.*)\$" "https://$API_DOMAIN/\$1"
+	ErrorLog \${APACHE_LOG_DIR}/mediathek-api-error.log
+	CustomLog \${APACHE_LOG_DIR}/mediathek-api-access.log combined
+</VirtualHost>
+
+<IfModule ssl_module>
+<IfFile $LE_DIR/fullchain.pem>
+<VirtualHost *:443>
+	ServerName $API_DOMAIN
+	DocumentRoot $ACME_ROOT
+	<Directory $ACME_ROOT>
+		Options None
+		AllowOverride None
+		Require all granted
+	</Directory>
+	SSLEngine on
+	SSLCertificateFile $LE_DIR/fullchain.pem
+	SSLCertificateKeyFile $LE_DIR/privkey.pem
+	<IfFile /etc/letsencrypt/options-ssl-apache.conf>
+		Include /etc/letsencrypt/options-ssl-apache.conf
+	</IfFile>
+	ErrorLog \${APACHE_LOG_DIR}/mediathek-api-error.log
+	CustomLog \${APACHE_LOG_DIR}/mediathek-api-access.log combined
+
+	# Freigegeben wird genau das, was das Plugin benutzt:
+	#   GET  /api/info, /api/listChannels, /api/listLivestream
+	#   POST /api.html (Suchanfragen)
+	# Das Plugin schickt nie URL-Parameter. Alles andere wird abgewiesen.
+	ProxyPassMatch "^/(api/(info|listChannels|listLivestream)|api\\.html)\$" "http://127.0.0.1:$API_PORT/mt-api/\$1" timeout=60 retry=5
+	<Location "/">
+		<If "%{QUERY_STRING} != '' || (%{REQUEST_URI} == '/api.html' && %{REQUEST_METHOD} != 'POST') || (%{REQUEST_URI} =~ m#^/api/# && ! %{REQUEST_METHOD} -in {'GET','HEAD'})">
+			Require all denied
+		</If>
+		<IfModule headers_module>
+			# Antworten sind JSON: nie als HTML deuten, keine Scripte, nicht einbetten
+			Header always set X-Content-Type-Options "nosniff"
+			Header always set Content-Security-Policy "default-src 'none'; frame-ancestors 'none'"
+			Header always set Referrer-Policy "no-referrer"
+			Header always set Strict-Transport-Security "max-age=31536000"
+		</IfModule>
+	</Location>
+</VirtualHost>
+</IfFile>
+</IfModule>
+EOF
+  fi
+
   cat > /etc/apache2/conf-available/mediathek-api-qos.conf <<EOF
 # Begrenzung für die Mediathek-API (mod_qos)
 <IfModule qos_module>
-	# höchstens $QOS_CONCURRENT gleichzeitige Anfragen an /mt-api/ auf dem ganzen Server
-	QS_LocRequestLimitMatch "^/mt-api/" $QOS_CONCURRENT
+	# API-Anfragen über /mt-api/ der Hauptseite und über die eigene Subdomain
+	# höchstens $QOS_CONCURRENT gleichzeitige API-Anfragen auf dem ganzen Server
+	QS_LocRequestLimitMatch "^/(mt-api/)?api(/(info|listChannels|listLivestream)|\\.html)\$" $QOS_CONCURRENT
 	# pro IP höchstens $QOS_PER_IP API-Anfragen in 60 Sekunden.
 	# Achtung: Wer das überschreitet, wird von mod_qos für den Rest der
 	# 60 Sekunden für den ganzen Server gesperrt (HTTP 429), nicht nur für die API.
-	SetEnvIf Request_URI "^/mt-api/" QS_MTAPI=1
+	SetEnvIf Request_URI "^/(mt-api/)?api(/(info|listChannels|listLivestream)|\\.html)\$" QS_MTAPI=1
 	QS_ClientEventLimitCount $QOS_PER_IP 60 QS_MTAPI
 	QS_ErrorResponseCode 429
 </IfModule>
@@ -768,6 +843,19 @@ EOF
     for m in "${ENABLED_MODS[@]}"; do a2dismod -q "$m" >/dev/null || true; done
     apache2ctl configtest || true
     die "Apache-Konfigurationstest fehlgeschlagen – eingeschaltete Module wieder abgeschaltet. Apache wurde nicht neu geladen."
+  fi
+
+  # vHost der Subdomain einschalten (bzw. ohne API_DOMAIN abschalten)
+  if [ -n "$API_DOMAIN" ]; then
+    SITE_WAS_ON=0; a2query -q -s mediathek-api && SITE_WAS_ON=1
+    a2ensite -q mediathek-api >/dev/null
+    if ! apache2ctl configtest >/dev/null 2>&1; then
+      [ "$SITE_WAS_ON" = 1 ] || a2dissite -q mediathek-api >/dev/null || true
+      apache2ctl configtest || true
+      die "Apache-Konfigurationstest mit dem vHost für $API_DOMAIN fehlgeschlagen – wieder abgeschaltet. Apache wurde nicht neu geladen."
+    fi
+  else
+    a2dissite -q mediathek-api >/dev/null 2>&1 || true
   fi
 
   # Begrenzung mit mod_qos (optional). Lässt es sich nicht laden, werden
@@ -853,17 +941,42 @@ einrichten und das Skript erneut starten:
   apt-get update
 EOF
 fi
+if [ -n "$API_DOMAIN" ] && [ -f "/etc/letsencrypt/live/$API_DOMAIN/fullchain.pem" ]; then
+cat <<EOF
+
+Apache-Dateien neu geschrieben. Wirksam nach:
+  apache2ctl configtest && systemctl reload apache2
+Test:  curl https://$API_DOMAIN/api/info
+EOF
+elif [ -n "$API_DOMAIN" ]; then
+cat <<EOF
+
+Noch zu tun (einmalig, von Hand), für https://$API_DOMAIN:
+  1. DNS: A-Eintrag (und ggf. AAAA) für $API_DOMAIN auf diesen Server.
+  2. apache2ctl configtest && systemctl reload apache2
+  3. Sobald der DNS-Eintrag gilt, das Zertifikat ausstellen:
+       certbot certonly --webroot -w $ACME_ROOT -d $API_DOMAIN \\
+         --deploy-hook "systemctl reload apache2"
+  4. apache2ctl configtest && systemctl reload apache2
+  5. Test:  curl https://$API_DOMAIN/api/info
+  6. Basis-URL im Plugin:  https://$API_DOMAIN
+
+  Die alte Adresse https://<hauptseite>/mt-api bleibt erreichbar, solange
+  /etc/apache2/mediathek-api.inc im HTTPS-vHost der Hauptseite eingebunden ist.
+EOF
+else
 cat <<'EOF'
 
 Noch zu tun (einmalig, von Hand):
-  1. In den HTTPS-VirtualHost von neutrino-images.de (z. B. in
+  1. In den HTTPS-VirtualHost der Hauptseite (z. B. in
      /etc/apache2/sites-available/<deine-site>-ssl.conf) innerhalb von
      <VirtualHost *:443> ... </VirtualHost> einfügen:
          Include /etc/apache2/mediathek-api.inc
   2. apache2ctl configtest && systemctl reload apache2
-  3. Test:  curl https://neutrino-images.de/mt-api/api/info
-  4. Basis-URL im Plugin:  https://neutrino-images.de/mt-api
+  3. Test:  curl https://<hauptseite>/mt-api/api/info
+  4. Basis-URL im Plugin:  https://<hauptseite>/mt-api
 EOF
+fi
 fi
 cat <<EOF
 
