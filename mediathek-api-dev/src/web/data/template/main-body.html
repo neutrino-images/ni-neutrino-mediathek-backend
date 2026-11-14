@@ -1,0 +1,75 @@
+    <link rel="stylesheet" type="text/css" href="/css/main.css" />
+    <script type="text/javascript" src="/js/base64.js"></script>
+    <script type="text/javascript" src="/js/main.js"></script>
+    <script type="text/javascript" src="/js/sql-formatter.min.js"></script>
+  </head>
+  <body>
+
+    <table class="formatTable">
+      <tr>
+        <td class="formatTD" style="width: 40%">
+          <div class="jsonInput">
+            <form action="/api.html" method="post" accept-charset="UTF-8" onSubmit='if (data1.value == "") data1.value = "{}";'>
+              <textarea name="data1" cols="50" rows="10">@@@JSON_TEXTAREA@@@</textarea>
+              <br />
+              <input type="submit" value=" send post data " />
+            </form>
+            <table class="buttonTable">
+              <tr>
+                <td class="buttonTD">
+                  <form action="/api.html" method="get" accept-charset="UTF-8">
+                    <input type="submit" value=" reset " />
+                  </form>
+                </td>
+                <td class="buttonTD">
+                  <form action="/api/info" method="get" accept-charset="UTF-8">
+                    <input type="submit" value=" prog info " />
+                  </form>
+                </td>
+                <td class="buttonTD">
+                  <form action="/api/listLivestream" method="get" accept-charset="UTF-8">
+                    <input type="submit" value=" list livestreams " />
+                  </form>
+                </td>
+                <td class="buttonTD">
+                  <form action="/api/listChannels" method="get" accept-charset="UTF-8">
+                    <input type="submit" value=" list channels " />
+                  </form>
+                </td>
+              </tr>
+            </table>
+          </div>
+        </td>
+        <td class="formatTD">
+          <div class="msgDiv"><pre class="msgPre" id="msgPre"></pre></div>
+        </td>
+      </tr>
+    </table>
+    <hr style='width: 80%;'>
+
+    <div id="sqlContainer">
+      <div id="sqlHeader">
+        <div id="sqlHeader_inner">
+          <span id="spoiler1_txt" class="spoiler1_txt" onclick="sqlSpoiler();">&nbsp;</span>
+        </div>
+      </div>
+      <div id="sql_0">
+        <div id="sql_1">
+          <div id="sqlCode_1">&nbsp;</div>
+        </div>
+        <div id="sql_2">
+          <div id="sqlCode_2">&nbsp;</div>
+        </div>
+        <div id="sqlFooter"></div>
+      </div>
+    </div>
+    <hr style='width: 80%;'>
+    <div id="jsonContainer">
+      <div id="jsonHeader">
+        <span class="jsonheader_txt">Json Output</span>
+      </div>
+      <div id="jsonContainer_inner">&nbsp;</div>
+    </div>
+<script type="text/javascript">
+  setFirstData();
+</script>
