@@ -1,0 +1,10 @@
+pw_mariadb
+mv2mariadb
+mv2mariadb.conf
+zz*.sh
+*.log
+*.diff
+*.patch
+config.mk
+*.o
+*.d

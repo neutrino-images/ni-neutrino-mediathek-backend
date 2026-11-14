@@ -1,0 +1,4 @@
+
+mv2mariadb is a tool for convert mediathekview data (json format) to sql (mariadb).
+
+For more information, see: https://wiki.slknet.de/w/README_Datenkonverter
