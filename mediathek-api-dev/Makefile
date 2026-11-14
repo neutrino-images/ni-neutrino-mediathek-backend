@@ -84,7 +84,8 @@ endif
 INCLUDES	 =
 INCLUDES	+= -I./src
 INCLUDES	+= -I/usr/include/mariadb
-INCLUDES	+= -I/usr/include/tidy
+# tidy.h as a system header: its own warnings are not ours to fix
+INCLUDES	+= -isystem /usr/include/tidy
 INCLUDES	+= -I/usr/include/boost
 INCLUDES	+= $(EXTRA_INCLUDES)
 
