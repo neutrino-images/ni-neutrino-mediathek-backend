@@ -82,7 +82,10 @@ bool CSql::connectMysql()
 		return false;
 	}
 
-	if (mysql_set_character_set(mysqlCon, "utf8") != 0) {
+	/* "utf8" is MariaDB's 3-byte utf8mb3: characters outside the BMP
+	 * (e.g. emoji in titles) would come back as '?'. The tables are
+	 * utf8mb4, so use the same for the connection. */
+	if (mysql_set_character_set(mysqlCon, "utf8mb4") != 0) {
 		show_error(__func__, __LINE__);
 		return false;
 	}
