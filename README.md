@@ -23,6 +23,10 @@ Ubuntu 22.04/24.04:
   (`API_DOMAIN`), and `/etc/apache2/mediathek-api.inc` to also serve the API
   as `/mt-api` of the main site; in both, only the requests the plugin needs
   are passed through
+- a WebTV list of the API's livestreams for Neutrino, written after every
+  import and served as a static file:
+  `https://mt-api.neutrino-images.de/livestreams.xml`. Added as a WebTV list
+  on the box, the livestreams show up as a bouquet without the plugin
 
 Run the script as root from a checkout of this repository. Without `REF` it
 builds exactly the commit that is checked out, so script and code always match.

@@ -29,6 +29,10 @@
 #      |
 #   mv2mariadb (stündlich per systemd-Timer)
 #
+# Nach jedem Import schreibt mediathek-webtv.service die Livestreams als
+# WebTV-Liste für Neutrino, die Apache als statische Datei ausliefert:
+#   https://mt-api.neutrino-images.de/livestreams.xml
+#
 # Ziel: Debian 12/13, Ubuntu 22.04/24.04. Als root ausführen.
 # Aufruf:
 #   install-mediathek-backend.sh              installieren bzw. aktualisieren
@@ -91,6 +95,7 @@ API_USER="${API_USER:-mt_api}"
 APACHE="${APACHE:-1}"
 API_DOMAIN="${API_DOMAIN-mt-api.neutrino-images.de}"
 ACME_ROOT="/var/www/mediathek-api"   # Document-Root der Subdomain (leer, Let's-Encrypt-Prüfdateien)
+WEBTV_DIR="/var/lib/mediathek-webtv" # WebTV-Liste der Livestreams (StateDirectory der Unit)
 QOS="${QOS:-1}"
 QOS_PER_IP="${QOS_PER_IP:-300}"
 QOS_CONCURRENT="${QOS_CONCURRENT:-30}"
@@ -114,6 +119,7 @@ MANAGED_PATHS=(
   "$IMPORTER_DIR/mv2mariadb"
   "$IMPORTER_DIR/sql"
   "$API_HOME/bin/mt-api"
+  "$API_HOME/bin/mediathek-webtv-xml"
   "$API_HOME/www"
   "$API_HOME/data/template"
   /etc/mediathek-api/lighttpd.conf
@@ -121,6 +127,7 @@ MANAGED_PATHS=(
   /etc/systemd/system/mediathek-importer.service
   /etc/systemd/system/mediathek-importer.timer
   /etc/systemd/system/mediathek-importer-full.service
+  /etc/systemd/system/mediathek-webtv.service
   /etc/logrotate.d/mediathek-api
   /etc/apache2/mediathek-api.inc
   /etc/apache2/sites-available/mediathek-api.conf
@@ -330,7 +337,7 @@ PKGS=(build-essential pkg-config git ca-certificates openssl
       libmariadb-dev libmariadb-dev-compat mariadb-client
       libcurl4-openssl-dev liblzma-dev libexpat1-dev rapidjson-dev
       libtidy-dev libjsoncpp-dev libboost-system-dev libfcgi-dev libssl-dev
-      sassc lighttpd logrotate util-linux)
+      sassc lighttpd logrotate util-linux curl jq)
 is_local_db && PKGS+=(mariadb-server)
 LIGHTTPD_WAS_INSTALLED=0
 dpkg-query -W -f='${Status}' lighttpd 2>/dev/null | grep -q "install ok installed" && LIGHTTPD_WAS_INSTALLED=1
@@ -667,12 +674,14 @@ EOF
 # Zwei Importer-Units mit derselben Härtung: der stündliche Lauf und der
 # Vollimport. Eine Sperrdatei verhindert, dass beide gleichzeitig laufen:
 # der stündliche Lauf überspringt dann, der Vollimport wartet.
+# Nach jedem erfolgreichen Lauf wird die WebTV-Liste neu geschrieben.
 write_importer_unit() {  # $1 = Unit-Datei, $2 = Beschreibung, $3 = flock-Optionen, $4 = Argumente
 cat > "/etc/systemd/system/$1" <<EOF
 [Unit]
 Description=$2
 After=network-online.target mariadb.service
 Wants=network-online.target
+OnSuccess=mediathek-webtv.service
 
 [Service]
 Type=oneshot
@@ -721,6 +730,70 @@ Persistent=true
 WantedBy=timers.target
 EOF
 
+log "WebTV-Liste der Livestreams einrichten"
+# Neutrino lädt WebTV-Listen auch von einer URL. Diese Liste enthält die
+# Livestreams der API, so dass sie ohne das Mediathek-Plugin als Bouquet
+# erscheinen. Sie wird aus der lokalen API erzeugt (gleiche Auswahl und
+# Titel wie im Plugin, keine eigenen Datenbank-Zugangsdaten) und von Apache
+# als statische Datei ausgeliefert. Das Skript best_bitrate_m3u8.lua gehört
+# zu jedem NI-Image und wählt die Auflösung nach der Einstellung der Box.
+cat > "$API_HOME/bin/mediathek-webtv-xml" <<'EOF'
+#!/bin/bash
+# mediathek-webtv-xml <Ausgabedatei> <URL von api/listLivestream>
+# Schreibt die Livestreams der Mediathek-API als WebTV-Liste für Neutrino.
+# Liefert die API nichts Brauchbares, bleibt die bisherige Liste stehen.
+set -euo pipefail
+out="$1" api="$2"
+tmp="$(mktemp "$out.XXXXXX")"
+trap 'rm -f "$tmp"' EXIT
+curl -fsS --noproxy '*' -m 30 "$api" | jq -r '
+  if .error != 0 or (.entry | length) == 0 then error("keine Livestreams") else . end
+  | "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+    "<webtvs name=\"Mediathek Livestreams\">",
+    (.entry[] | select((.title // "") != "" and ((.url // "") | test("^https?://")))
+      | "\t<webtv title=\"\(.title | @html)\" url=\"\(.url | @html)\" description=\"Livestream\" script=\"best_bitrate_m3u8.lua\"/>"),
+    "</webtvs>"' > "$tmp"
+grep -q '<webtv ' "$tmp" || { echo "keine gültigen Livestreams in $api" >&2; exit 1; }
+# Unveränderte Liste nicht ersetzen (Datum der Datei bleibt, gut für Caches)
+cmp -s "$tmp" "$out" && exit 0
+chmod 644 "$tmp"
+mv "$tmp" "$out"
+EOF
+chmod 755 "$API_HOME/bin/mediathek-webtv-xml"
+
+# Läuft nach jedem erfolgreichen Import (OnSuccess= der Importer-Units) und
+# darf nur die lokale API erreichen und nur in $WEBTV_DIR schreiben.
+cat > /etc/systemd/system/mediathek-webtv.service <<EOF
+[Unit]
+Description=Livestreams der Mediathek als WebTV-Liste für Neutrino schreiben
+After=mediathek-api.service
+
+[Service]
+Type=oneshot
+User=$WEB_USER
+Group=$WEB_USER
+StateDirectory=$(basename "$WEBTV_DIR")
+StateDirectoryMode=0755
+ExecStart=$API_HOME/bin/mediathek-webtv-xml $WEBTV_DIR/livestreams.xml http://127.0.0.1:$API_PORT/mt-api/api/listLivestream
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+EOF
+
 log "Log-Rotation für die API einrichten"
 # Ohne Rotation könnte jemand mit vielen Anfragen die Platte füllen.
 cat > /etc/logrotate.d/mediathek-api <<EOF
@@ -750,7 +823,15 @@ if [ "$APACHE" = 1 ]; then
 #   POST /mt-api/api.html (Suchanfragen)
 # Das Plugin schickt nie URL-Parameter. Alles andere wird abgewiesen, darunter
 # die HTML-Start- und Fehlerseiten der API.
+# Dazu die WebTV-Liste für Neutrino als statische Datei:
+#   GET  /mt-api/livestreams.xml
 ProxyPassMatch "^/mt-api/(api/(info|listChannels|listLivestream)|api\\.html)\$" "http://127.0.0.1:$API_PORT/mt-api/\$1" timeout=60 retry=5
+Alias "/mt-api/livestreams.xml" "$WEBTV_DIR/livestreams.xml"
+<Directory "$WEBTV_DIR">
+	Options None
+	AllowOverride None
+	Require all granted
+</Directory>
 
 <LocationMatch "^/mt-api/">
 	<If "%{QUERY_STRING} != '' || (%{REQUEST_URI} == '/mt-api/api.html' && %{REQUEST_METHOD} != 'POST') || (%{REQUEST_URI} =~ m#^/mt-api/api/# && ! %{REQUEST_METHOD} -in {'GET','HEAD'})">
@@ -813,7 +894,15 @@ EOF
 	#   GET  /api/info, /api/listChannels, /api/listLivestream
 	#   POST /api.html (Suchanfragen)
 	# Das Plugin schickt nie URL-Parameter. Alles andere wird abgewiesen.
+	# Dazu die WebTV-Liste für Neutrino als statische Datei:
+	#   GET  /livestreams.xml
 	ProxyPassMatch "^/(api/(info|listChannels|listLivestream)|api\\.html)\$" "http://127.0.0.1:$API_PORT/mt-api/\$1" timeout=60 retry=5
+	Alias "/livestreams.xml" "$WEBTV_DIR/livestreams.xml"
+	<Directory "$WEBTV_DIR">
+		Options None
+		AllowOverride None
+		Require all granted
+	</Directory>
 	<Location "/">
 		<If "%{QUERY_STRING} != '' || (%{REQUEST_URI} == '/api.html' && %{REQUEST_METHOD} != 'POST') || (%{REQUEST_URI} =~ m#^/api/# && ! %{REQUEST_METHOD} -in {'GET','HEAD'})">
 			Require all denied
@@ -944,6 +1033,16 @@ else
   warn "Die API antwortet nicht wie erwartet. Prüfen: systemctl status mediathek-api, $API_HOME/log/error.log"
 fi
 
+if [ "$HAVE_SYSTEMD" = 1 ]; then
+  log "WebTV-Liste der Livestreams schreiben"
+  systemctl reset-failed mediathek-webtv.service 2>/dev/null || true
+  if systemctl start mediathek-webtv.service; then
+    echo "    OK: $WEBTV_DIR/livestreams.xml ($(grep -c '<webtv ' "$WEBTV_DIR/livestreams.xml") Livestreams)"
+  else
+    warn "WebTV-Liste noch nicht geschrieben (Datenbank leer?). Das passiert nach dem nächsten erfolgreichen Import von selbst."
+  fi
+fi
+
 cat <<EOF
 
 Fertig. Lokaler Test:
@@ -966,6 +1065,7 @@ cat <<EOF
 Apache-Dateien neu geschrieben. Wirksam nach:
   apache2ctl configtest && systemctl reload apache2
 Test:  curl https://$API_DOMAIN/api/info
+WebTV-Liste für Neutrino:  https://$API_DOMAIN/livestreams.xml
 EOF
 elif [ -n "$API_DOMAIN" ]; then
 cat <<EOF
@@ -1001,6 +1101,7 @@ cat <<EOF
 
 Logs:
   Import:   journalctl -u mediathek-importer -u mediathek-importer-full
+  WebTV:    journalctl -u mediathek-webtv
   API:      $API_HOME/log/error.log und $API_HOME/log/mt-api.requests.log
   Timer:    systemctl list-timers mediathek-importer.timer
 EOF
