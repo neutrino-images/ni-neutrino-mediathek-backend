@@ -32,6 +32,7 @@
 # Nach jedem Import schreibt mediathek-webtv.service die Livestreams als
 # WebTV-Liste für Neutrino, die Apache als statische Datei ausliefert:
 #   https://mt-api.neutrino-images.de/livestreams.xml
+# Die EPG dazu holt die Box selbst aus dem XMLTV-Guide von epgshare01.
 #
 # Ziel: Debian 12/13, Ubuntu 22.04/24.04. Als root ausführen.
 # Aufruf:
@@ -65,6 +66,9 @@
 #   QOS=1                 Begrenzung mit mod_qos einrichten (0 = weglassen)
 #   QOS_PER_IP=300        max. API-Anfragen pro IP und Minute (mod_qos)
 #   QOS_CONCURRENT=30     max. gleichzeitige API-Anfragen insgesamt (mod_qos)
+#   EPG_XMLTV=<URL>       XMLTV-Guide, den die WebTV-Liste den Boxen für die
+#                         EPG der Livestreams nennt (Standard: Deutschland-
+#                         Datei von epgshare01; leer = Liste ohne EPG)
 #   SKIP_FIRST_IMPORT=1   ersten Vollimport nicht automatisch starten
 #   REF=<tag|commit>      bestimmten Stand des Repos bauen, z. B. REF=NI-2026.11
 #                         Ohne Angabe: Wird das Skript aus einem Checkout des
@@ -96,6 +100,7 @@ APACHE="${APACHE:-1}"
 API_DOMAIN="${API_DOMAIN-mt-api.neutrino-images.de}"
 ACME_ROOT="/var/www/mediathek-api"   # Document-Root der Subdomain (leer, Let's-Encrypt-Prüfdateien)
 WEBTV_DIR="/var/lib/mediathek-webtv" # WebTV-Liste der Livestreams (StateDirectory der Unit)
+EPG_XMLTV="${EPG_XMLTV-https://epgshare01.online/epgshare01/epg_ripper_DE1.xml.gz}"
 QOS="${QOS:-1}"
 QOS_PER_IP="${QOS_PER_IP:-300}"
 QOS_CONCURRENT="${QOS_CONCURRENT:-30}"
@@ -120,6 +125,7 @@ MANAGED_PATHS=(
   "$IMPORTER_DIR/sql"
   "$API_HOME/bin/mt-api"
   "$API_HOME/bin/mediathek-webtv-xml"
+  "$API_HOME/data/livestreams-epg.tsv"
   "$API_HOME/www"
   "$API_HOME/data/template"
   /etc/mediathek-api/lighttpd.conf
@@ -737,21 +743,33 @@ log "WebTV-Liste der Livestreams einrichten"
 # Titel wie im Plugin, keine eigenen Datenbank-Zugangsdaten) und von Apache
 # als statische Datei ausgeliefert. Das Skript best_bitrate_m3u8.lua gehört
 # zu jedem NI-Image und wählt die Auflösung nach der Einstellung der Box.
+# Für die EPG nennt jeder Eintrag den XMLTV-Guide (EPG_XMLTV) und seinen
+# Kanal darin, nach webtv/livestreams-epg.tsv im Repo. Den Guide lädt die
+# Box selbst; der Server holt ihn nicht.
 cat > "$API_HOME/bin/mediathek-webtv-xml" <<'EOF'
 #!/bin/bash
 # mediathek-webtv-xml <Ausgabedatei> <URL von api/listLivestream>
-# Schreibt die Livestreams der Mediathek-API als WebTV-Liste für Neutrino.
+#                     <Zuordnung .tsv> [<URL des XMLTV-Guides>]
+# Schreibt die Livestreams der Mediathek-API als WebTV-Liste für Neutrino,
+# mit der EPG aus dem XMLTV-Guide nach der Zuordnung (Titel -> Kanal-ID).
 # Liefert die API nichts Brauchbares, bleibt die bisherige Liste stehen.
 set -euo pipefail
-out="$1" api="$2"
+out="$1" api="$2" map="$3" xmltv="${4:-}"
 tmp="$(mktemp "$out.XXXXXX")"
 trap 'rm -f "$tmp"' EXIT
-curl -fsS --noproxy '*' -m 30 "$api" | jq -r '
-  if .error != 0 or (.entry | length) == 0 then error("keine Livestreams") else . end
+curl -fsS --noproxy '*' -m 30 "$api" | jq -r --rawfile map "$map" --arg xmltv "$xmltv" '
+  def norm: gsub("\\s+"; " ") | ltrimstr(" ") | rtrimstr(" ");
+  ($map | split("\n") | map(select(test("^[^#]")) | split("\t")
+    | select(length > 1 and .[1] != "") | {key: (.[0] | norm), value: .[1]})
+    | from_entries) as $epg
+  | if .error != 0 or (.entry | length) == 0 then error("keine Livestreams") else . end
   | "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
     "<webtvs name=\"Mediathek Livestreams\">",
-    (.entry[] | select((.title // "") != "" and ((.url // "") | test("^https?://")))
-      | "\t<webtv title=\"\(.title | @html)\" url=\"\(.url | @html)\" description=\"Livestream\" script=\"best_bitrate_m3u8.lua\"/>"),
+    (.entry[] | (.title // "" | norm) as $t
+      | select($t != "" and ((.url // "") | test("^https?://")))
+      | "\t<webtv title=\"\($t | @html)\" url=\"\(.url | @html)\""
+        + (if $xmltv != "" and $epg[$t] then " xmltv=\"\($xmltv | @html)\" epgmap=\"\($epg[$t] | @html)\"" else "" end)
+        + " description=\"Livestream\" script=\"best_bitrate_m3u8.lua\"/>"),
     "</webtvs>"' > "$tmp"
 grep -q '<webtv ' "$tmp" || { echo "keine gültigen Livestreams in $api" >&2; exit 1; }
 # Unveränderte Liste nicht ersetzen (Datum der Datei bleibt, gut für Caches)
@@ -760,6 +778,7 @@ chmod 644 "$tmp"
 mv "$tmp" "$out"
 EOF
 chmod 755 "$API_HOME/bin/mediathek-webtv-xml"
+install -m 644 "$REPO_DIR/webtv/livestreams-epg.tsv" "$API_HOME/data/"
 
 # Läuft nach jedem erfolgreichen Import (OnSuccess= der Importer-Units) und
 # darf nur die lokale API erreichen und nur in $WEBTV_DIR schreiben.
@@ -774,7 +793,7 @@ User=$WEB_USER
 Group=$WEB_USER
 StateDirectory=$(basename "$WEBTV_DIR")
 StateDirectoryMode=0755
-ExecStart=$API_HOME/bin/mediathek-webtv-xml $WEBTV_DIR/livestreams.xml http://127.0.0.1:$API_PORT/mt-api/api/listLivestream
+ExecStart=$API_HOME/bin/mediathek-webtv-xml $WEBTV_DIR/livestreams.xml http://127.0.0.1:$API_PORT/mt-api/api/listLivestream $API_HOME/data/livestreams-epg.tsv $EPG_XMLTV
 
 NoNewPrivileges=yes
 ProtectSystem=strict

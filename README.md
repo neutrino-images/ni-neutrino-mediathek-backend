@@ -27,6 +27,9 @@ Ubuntu 22.04/24.04:
   import and served as a static file:
   `https://mt-api.neutrino-images.de/livestreams.xml`. Added as a WebTV list
   on the box, the livestreams show up as a bouquet without the plugin
+- the EPG of the livestreams from the XMLTV guide of epgshare01
+  (`EPG_XMLTV`), mapped in `webtv/livestreams-epg.tsv`; the box loads the
+  guide itself
 
 Run the script as root from a checkout of this repository. Without `REF` it
 builds exactly the commit that is checked out, so script and code always match.

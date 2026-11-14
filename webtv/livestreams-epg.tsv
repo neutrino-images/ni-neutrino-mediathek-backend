@@ -1,0 +1,46 @@
+# EPG der Mediathek-Livestreams in der WebTV-Liste für Neutrino
+#
+# Je Zeile, durch einen Tabulator getrennt:
+#   1. Titel, wie ihn api/listLivestream liefert (mehrere Leerzeichen
+#      zählen als eines)
+#   2. Kanal-ID im XMLTV-Guide von epgshare01 (EPG_XMLTV des
+#      Installationsskripts), Liste der IDs: epg_ripper_DE1.txt daneben
+# Ein Livestream, der hier fehlt, erscheint ohne EPG. Keinen eigenen Eintrag
+# im Guide haben ARTE.FR, DW, Radio Bremen TV und SR; die Regionalvarianten
+# von BR, MDR, RBB, SWR und die WDR-Lokalzeiten zeigen das Hauptprogramm.
+3Sat	3sat.de
+ARD	Das.Erste.de
+ARD Alpha	ARD.alpha.de
+ARD ONE	ONE.de
+ARD Tagesschau	tagesschau24.de
+ARTE.DE	ARTE.de
+BR Nord	BR.de
+BR Süd	BR.de
+HR	HR.de
+KiKA	KIKA.de
+MDR Sachsen	MDR.de
+MDR Sachsen-Anhalt	MDR.de
+MDR Thüringen	MDR.de
+ORF-1	ORF.1.de
+ORF-2	ORF.2.de
+ORF-3	ORF.III.de
+ORF-Sport	ORF.SPORT.+.de
+PHOENIX	PHOENIX.de
+RBB Berlin	RBB.de
+RBB Brandenburg	RBB.de
+SWR BW	SWR/SR.de
+SWR RP	SWR/SR.de
+WDR (Deutschland)	WDR.de
+WDR Lokalzeit Aachen	WDR.de
+WDR Lokalzeit Bielefeld	WDR.de
+WDR Lokalzeit Bonn	WDR.de
+WDR Lokalzeit Dortmund	WDR.de
+WDR Lokalzeit Duisburg	WDR.de
+WDR Lokalzeit Düsseldorf	WDR.de
+WDR Lokalzeit Essen	WDR.de
+WDR Lokalzeit Münster	WDR.de
+WDR Lokalzeit Siegen	WDR.de
+WDR Lokalzeit Wuppertal	WDR.de
+ZDF	ZDF.de
+ZDF.info	ZDFinfo.de
+ZDF.neo	ZDFneo.de
