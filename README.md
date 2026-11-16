@@ -1,5 +1,7 @@
 # NI \o/ - Neutrino-Mediathek-Backend
 
+Backend for https://github.com/neutrino-images/ni-neutrino-plugins/tree/master/scripts-lua/plugins/mediathek
+
 Tuxbox-Repositories were added with
 
 ```
