@@ -32,6 +32,10 @@ Ubuntu 22.04/24.04:
 - the EPG of the livestreams from the XMLTV guide of epgshare01
   (`EPG_XMLTV`), mapped in `webtv/livestreams-epg.tsv`; the box loads the
   guide itself
+- a usage statistics page at `https://mt-api.neutrino-images.de/`, written
+  once an hour from the Apache access log as a static page without scripts
+  (`stats/mediathek-stats`); IP addresses are only counted, per day only
+  totals are kept
 
 Run the script as root from a checkout of this repository. Without `REF` it
 builds exactly the commit that is checked out, so script and code always match.

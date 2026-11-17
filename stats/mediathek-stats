@@ -1,0 +1,319 @@
+#!/usr/bin/python3 -I
+# mediathek-stats <Apache-Zugriffslog> <URL von api/info> <Verzeichnis>
+# Zählt die Nutzung der Mediathek-API aus dem Zugriffslog (samt den von
+# logrotate gedrehten Dateien) und schreibt eine statische Seite index.html.
+# IP-Adressen werden nur zum Zählen gelesen: in state.json stehen je Tag
+# allein Summen, so dass der Verlauf über die Aufbewahrung der Logs reicht.
+import glob, gzip, html, json, os, re, sys, tempfile, time, urllib.request
+from datetime import datetime, timedelta
+
+LOG, INFO_URL, OUTDIR = sys.argv[1:4]
+STATE = os.path.join(OUTDIR, "state.json")
+KEEP_DAYS = 400
+
+# Was das Plugin und Neutrino abrufen; der Pfad ohne /mt-api der Hauptseite
+KINDS = [
+    ("info", "/api/info", "Plugin-Start"),
+    ("channels", "/api/listChannels", "Senderliste"),
+    ("search", "/api.html", "Sendungen und Suche"),
+    ("live", "/api/listLivestream", "Livestreams im Plugin"),
+    ("webtv", "/livestreams.xml", "WebTV-Liste von Neutrino"),
+]
+BY_PATH = {path: key for key, path, _ in KINDS}
+LINE = re.compile(r'^(\S+) \S+ \S+ \[(\d\d)/(\w{3})/(\d{4}):(\d\d):\d\d:\d\d [^\]]*\] '
+                  r'"(\S+) (\S+)[^"]*" (\d{3}) (\S+)')
+MONTHS = {m: i for i, m in enumerate(
+    ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], 1)}
+
+
+def new_day():
+    return {"boxes": 0, "kinds": {k: 0 for k, _, _ in KINDS}, "denied": 0,
+            "limited": 0, "errors": 0, "bytes": 0, "hours": [0] * 24}
+
+
+def log_files():
+    files = [LOG] + glob.glob(LOG + ".[0-9]*")
+    def age(f):
+        m = re.search(r"\.(\d+)(\.gz)?$", f[len(LOG):])
+        return int(m.group(1)) if m else 0
+    return sorted((f for f in files if os.path.isfile(f)), key=age, reverse=True)
+
+
+def read_logs():
+    days, ips = {}, {}
+    for f in log_files():
+        with (gzip.open if f.endswith(".gz") else open)(f, "rt", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                m = LINE.match(line)
+                if not m:
+                    continue
+                ip, dd, mon, yyyy, hh, method, path, status, size = m.groups()
+                if mon not in MONTHS:
+                    continue
+                day = "%s-%02d-%s" % (yyyy, MONTHS[mon], dd)
+                path = path.split("?", 1)[0]
+                if path.startswith("/mt-api/"):
+                    path = path[7:]
+                kind = BY_PATH.get(path)
+                if kind is None:
+                    continue  # Startseite, Zertifikatsprüfung, Scanner
+                d = days.setdefault(day, new_day())
+                status = int(status)
+                if status == 429:
+                    d["limited"] += 1
+                elif status >= 500:
+                    d["errors"] += 1
+                elif status >= 400:
+                    d["denied"] += 1
+                elif method in ("GET", "POST"):
+                    d["kinds"][kind] += 1
+                    d["hours"][int(hh)] += 1
+                    d["bytes"] += int(size) if size.isdigit() else 0
+                    ips.setdefault(day, set()).add(ip)
+    for day, s in ips.items():
+        days[day]["boxes"] = len(s)
+    return days, ips
+
+
+def total(d):
+    return sum(d["kinds"].values())
+
+
+def merge(state, days):
+    # Ein Tag, den die Logs nur noch zum Teil enthalten (die älteste gedrehte
+    # Datei beginnt mitten am Tag), ersetzt den gespeicherten nicht.
+    for day, d in days.items():
+        old = state.get(day)
+        if old is None or total(d) + d["denied"] + d["errors"] + d["limited"] >= \
+                total(old) + old["denied"] + old["errors"] + old["limited"]:
+            state[day] = d
+    for day in sorted(state)[:-KEEP_DAYS]:
+        del state[day]
+    return state
+
+
+def api_info():
+    try:
+        with urllib.request.urlopen(INFO_URL, timeout=10) as r:
+            return json.load(r)["entry"][0]
+    except Exception:
+        return None
+
+
+def fmt_int(n):
+    return "{:,}".format(int(n)).replace(",", ".")
+
+
+def fmt_time(t):
+    return time.strftime("%d.%m.%Y %H:%M", time.localtime(t)) if t else "–"
+
+
+def fmt_bytes(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1000 or unit == "GB":
+            return ("%.0f %s" if unit == "B" else "%.1f %s") % (n, unit)
+        n /= 1000.0
+
+
+def nice_max(v):
+    """Obergrenze der Achse: vier gleiche, ganzzahlige, runde Schritte."""
+    need, mag = max(v, 1) / 4.0, 1
+    while True:
+        for step in (1, 1.5, 2, 2.5, 3, 4, 5, 6, 8):
+            if step * mag >= need and step * mag == int(step * mag):
+                return int(4 * step * mag)
+        mag *= 10
+
+
+def bar_chart(values, labels, tips, label_every, title):
+    """Säulen mit einer Grundlinie, 4px gerundetem Ende und SVG-Tooltip."""
+    w, h, left, right, top, bottom = 720, 210, 64, 8, 14, 34
+    pw, ph = w - left - right, h - top - bottom
+    top_v = nice_max(max(values) if values else 0)
+    n = max(len(values), 1)
+    band = pw / n
+    bw = min(24.0, band * 0.7)
+    out = ['<svg class="chart" viewBox="0 0 %d %d" role="img" aria-label="%s">' % (w, h, html.escape(title))]
+    for i in range(5):
+        v = top_v * i / 4
+        y = top + ph - ph * i / 4
+        out.append('<line class="grid" x1="%d" x2="%d" y1="%.1f" y2="%.1f"/>' % (left, w - right, y, y))
+        out.append('<text class="tick" x="%d" y="%.1f" text-anchor="end">%s</text>' % (left - 6, y + 4, fmt_int(v)))
+    for i, v in enumerate(values):
+        x = left + band * i + (band - bw) / 2
+        bh = ph * v / top_v if top_v else 0
+        y = top + ph - bh
+        out.append('<g class="mark"><title>%s</title>' % html.escape(tips[i]))
+        out.append('<rect class="hit" x="%.1f" y="%d" width="%.1f" height="%d"/>' % (left + band * i, top, band, ph))
+        if bh > 0:
+            r = min(4.0, bh, bw / 2)
+            out.append('<path class="bar" d="M%.1f,%.1f v%.1f a%.1f,%.1f 0 0 1 %.1f,-%.1f h%.1f a%.1f,%.1f 0 0 1 %.1f,%.1f v%.1f z"/>' % (
+                x, top + ph, -(bh - r), r, r, r, r, bw - 2 * r, r, r, r, r, bh - r))
+        out.append('</g>')
+        if i % label_every == 0 or i == n - 1 and n <= 24:
+            out.append('<text class="tick" x="%.1f" y="%d" text-anchor="middle">%s</text>' % (x + bw / 2, h - 8, html.escape(labels[i])))
+    out.append('<line class="axis" x1="%d" x2="%d" y1="%d" y2="%d"/>' % (left, w - right, top + ph, top + ph))
+    out.append("</svg>")
+    return "".join(out)
+
+
+def render(state, ips, info, now):
+    today = datetime.fromtimestamp(now).date()
+    last = [(today - timedelta(days=i)).isoformat() for i in range(29, -1, -1)]
+    data = [state.get(d) or new_day() for d in last]
+    wd = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
+    def dlabel(iso, wday=False):
+        dt = datetime.strptime(iso, "%Y-%m-%d")
+        return ("%s %s" % (wd[dt.weekday()], dt.strftime("%d.%m."))) if wday else dt.strftime("%d.%m.")
+
+    week = set()
+    for d in last[-7:]:
+        week |= ips.get(d, set())
+    t, y = data[-1], data[-2]
+    sum7 = sum(total(d) for d in data[-7:])
+    sum30 = sum(total(d) for d in data)
+    hours = [sum(d["hours"][hh] for d in data[-7:]) for hh in range(24)]
+
+    kpis = [
+        ("Boxen heute", fmt_int(t["boxes"]), "gestern %s" % fmt_int(y["boxes"])),
+        ("Boxen in 7 Tagen", fmt_int(len(week)), "verschiedene Adressen"),
+        ("Anfragen heute", fmt_int(total(t)), "gestern %s" % fmt_int(total(y))),
+        ("Anfragen in 30 Tagen", fmt_int(sum30), "%s in 7 Tagen" % fmt_int(sum7)),
+    ]
+    rows = []
+    for key, _, name in KINDS:
+        rows.append("<tr><th scope=\"row\">%s</th><td>%s</td><td>%s</td><td>%s</td></tr>" % (
+            html.escape(name), fmt_int(t["kinds"][key]),
+            fmt_int(sum(d["kinds"][key] for d in data[-7:])), fmt_int(sum(d["kinds"][key] for d in data))))
+    problems = [
+        ("Abgewiesen (unerlaubte Anfrage)", "denied"),
+        ("Gebremst (zu viele Anfragen, 429)", "limited"),
+        ("Serverfehler (5xx)", "errors"),
+    ]
+    prow = "".join("<tr><th scope=\"row\">%s</th><td>%s</td><td>%s</td><td>%s</td></tr>" % (
+        name, fmt_int(t[k]), fmt_int(sum(d[k] for d in data[-7:])), fmt_int(sum(d[k] for d in data)))
+        for name, k in problems)
+    daily = "".join("<tr><th scope=\"row\">%s</th><td>%s</td><td>%s</td><td>%s</td></tr>" % (
+        dlabel(day, True), fmt_int(d["boxes"]), fmt_int(total(d)), fmt_bytes(d["bytes"]))
+        for day, d in reversed(list(zip(last, data))))
+
+    if info:
+        db = "%s Einträge · Filmliste vom %s · eingelesen %s" % (
+            fmt_int(info.get("mventrys", 0)), fmt_time(info.get("mvdate")), fmt_time(info.get("vdate")))
+        ver = "API %s · Importer %s" % (html.escape(str(info.get("apiversion", "?"))), html.escape(str(info.get("progversion", "?"))))
+    else:
+        db, ver = "Datenbank gerade nicht erreichbar", ""
+
+    charts = [
+        ("Boxen pro Tag", "letzte 30 Tage",
+         bar_chart([d["boxes"] for d in data], [dlabel(d) for d in last],
+                   ["%s: %s Boxen" % (dlabel(day, True), fmt_int(d["boxes"])) for day, d in zip(last, data)], 5, "Boxen pro Tag")),
+        ("Anfragen pro Tag", "letzte 30 Tage",
+         bar_chart([total(d) for d in data], [dlabel(d) for d in last],
+                   ["%s: %s Anfragen" % (dlabel(day, True), fmt_int(total(d))) for day, d in zip(last, data)], 5, "Anfragen pro Tag")),
+        ("Anfragen nach Uhrzeit", "letzte 7 Tage, Summe je Stunde",
+         bar_chart(hours, ["%d" % hh for hh in range(24)],
+                   ["%02d–%02d Uhr: %s Anfragen" % (hh, (hh + 1) % 24, fmt_int(v)) for hh, v in enumerate(hours)], 3, "Anfragen nach Uhrzeit")),
+    ]
+    chart_html = "".join(
+        '<section class="card"><h2>%s</h2><p class="sub">%s</p>%s</section>' % (a, b, c) for a, b, c in charts)
+    kpi_html = "".join(
+        '<div class="kpi"><div class="label">%s</div><div class="value">%s</div><div class="sub">%s</div></div>' % k for k in kpis)
+
+    page = """<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mediathek-API · Nutzung</title>
+<style>
+:root { color-scheme: light; --surface-0:#f4f4f2; --surface-1:#fcfcfb; --text-primary:#0b0b0b;
+  --text-secondary:#52514e; --text-muted:#76756f; --grid:#e4e3df; --axis:#a9a8a2; --series-1:#2a78d6; }
+@media (prefers-color-scheme: dark) { :root { color-scheme: dark; --surface-0:#111110; --surface-1:#1a1a19;
+  --text-primary:#f0efec; --text-secondary:#c3c2b7; --text-muted:#97968d; --grid:#2c2c2a; --axis:#5c5b56; --series-1:#3987e5; } }
+* { box-sizing: border-box; }
+body { margin:0; background:var(--surface-0); color:var(--text-primary);
+  font:15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+main { max-width:960px; margin:0 auto; padding:28px 18px 40px; }
+h1 { font-size:24px; margin:0 0 4px; }
+h2 { font-size:16px; margin:0; }
+.meta, .sub, .note { color:var(--text-secondary); margin:0; }
+.note { font-size:13px; color:var(--text-muted); margin-top:24px; }
+.kpis { display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:12px; margin:22px 0; }
+.kpi, .card { background:var(--surface-1); border-radius:10px; padding:16px 18px; }
+.kpi .label { color:var(--text-secondary); font-size:13px; }
+.kpi .value { font-size:32px; font-weight:600; font-variant-numeric:tabular-nums; }
+.kpi .sub { font-size:13px; color:var(--text-muted); }
+.card { margin-top:12px; }
+.chart { width:100%; height:auto; display:block; margin-top:10px; }
+.chart .grid { stroke:var(--grid); stroke-width:1; }
+.chart .axis { stroke:var(--axis); stroke-width:1; }
+.chart .tick { fill:var(--text-muted); font-size:11px; }
+.chart .bar { fill:var(--series-1); }
+.chart .hit { fill:transparent; }
+.chart .mark:hover .bar { opacity:.8; }
+table { width:100%; border-collapse:collapse; margin-top:10px; font-variant-numeric:tabular-nums; }
+th, td { padding:6px 8px; border-bottom:1px solid var(--grid); text-align:right; }
+th[scope=row], thead th:first-child { text-align:left; font-weight:normal; }
+thead th { color:var(--text-secondary); font-weight:600; font-size:13px; }
+details { margin-top:12px; }
+@media (max-width: 600px) {
+  main { padding:18px 12px 32px; }
+  .kpi .value { font-size:26px; }
+  .chart .tick { font-size:22px; }
+}
+summary { cursor:pointer; color:var(--text-secondary); }
+</style>
+</head>
+<body>
+<main>
+<h1>Mediathek-API · Nutzung</h1>
+<p class="meta">Stand @now@ · @db@</p>
+<div class="kpis">@kpis@</div>
+@charts@
+<section class="card"><h2>Anfragen nach Art</h2>
+<table><thead><tr><th>Art</th><th>heute</th><th>7 Tage</th><th>30 Tage</th></tr></thead><tbody>@rows@</tbody></table></section>
+<section class="card"><h2>Abgewiesene und fehlgeschlagene Anfragen</h2>
+<table><thead><tr><th>Art</th><th>heute</th><th>7 Tage</th><th>30 Tage</th></tr></thead><tbody>@prow@</tbody></table></section>
+<details class="card"><summary>Alle Tage als Tabelle</summary>
+<table><thead><tr><th>Tag</th><th>Boxen</th><th>Anfragen</th><th>Daten</th></tr></thead><tbody>@daily@</tbody></table></details>
+<p class="note">Gezählt werden erfolgreiche Abrufe des Mediathek-Plugins und der WebTV-Liste
+über mt-api.neutrino-images.de und neutrino-images.de/mt-api. „Boxen“ sind verschiedene
+IP-Adressen: Boxen hinter einem Router zählen als eine, eine Box mit wechselnder Adresse
+mehrfach. Die Adressen werden nur zum Zählen gelesen und nicht gespeichert, Suchbegriffe
+gar nicht erfasst. Aktualisierung stündlich. @ver@</p>
+</main>
+</body>
+</html>
+"""
+    fill = {"now": fmt_time(now), "db": html.escape(db), "kpis": kpi_html, "charts": chart_html,
+            "rows": "".join(rows), "prow": prow, "daily": daily, "ver": ver}
+    return re.sub(r"@(\w+)@", lambda m: fill[m.group(1)], page)
+
+
+def write_atomic(path, data):
+    fd, tmp = tempfile.mkstemp(dir=OUTDIR, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(data)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+
+
+def main():
+    try:
+        with open(STATE, encoding="utf-8") as f:
+            state = json.load(f)
+    except (FileNotFoundError, ValueError):
+        state = {}
+    days, ips = read_logs()
+    state = merge(state, days)
+    now = time.time()
+    write_atomic(STATE, json.dumps(state, sort_keys=True))
+    write_atomic(os.path.join(OUTDIR, "index.html"), render(state, ips, api_info(), now))
+
+
+main()

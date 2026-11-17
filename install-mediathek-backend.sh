@@ -34,6 +34,9 @@
 #   https://mt-api.neutrino-images.de/livestreams.xml
 # Die EPG dazu holt die Box selbst aus dem XMLTV-Guide von epgshare01.
 #
+# Stündlich schreibt mediathek-stats.timer aus dem Apache-Zugriffslog eine
+# statische Statistikseite: https://mt-api.neutrino-images.de/
+#
 # Ziel: Debian 12/13, Ubuntu 22.04/24.04. Als root ausführen.
 # Aufruf:
 #   install-mediathek-backend.sh              installieren bzw. aktualisieren
@@ -100,6 +103,8 @@ APACHE="${APACHE:-1}"
 API_DOMAIN="${API_DOMAIN-mt-api.neutrino-images.de}"
 ACME_ROOT="/var/www/mediathek-api"   # Document-Root der Subdomain (leer, Let's-Encrypt-Prüfdateien)
 WEBTV_DIR="/var/lib/mediathek-webtv" # WebTV-Liste der Livestreams (StateDirectory der Unit)
+STATS_DIR="/var/lib/mediathek-stats" # Statistikseite und ihre Tagessummen (StateDirectory)
+API_LOG="/var/log/apache2/mediathek-api-access.log" # Zugriffe auf die API über Apache
 EPG_XMLTV="${EPG_XMLTV-https://epgshare01.online/epgshare01/epg_ripper_DE1.xml.gz}"
 QOS="${QOS:-1}"
 QOS_PER_IP="${QOS_PER_IP:-300}"
@@ -126,6 +131,7 @@ MANAGED_PATHS=(
   "$API_HOME/bin/mt-api"
   "$API_HOME/bin/mediathek-webtv-xml"
   "$API_HOME/data/livestreams-epg.tsv"
+  "$API_HOME/bin/mediathek-stats"
   "$API_HOME/www"
   "$API_HOME/data/template"
   /etc/mediathek-api/lighttpd.conf
@@ -134,6 +140,8 @@ MANAGED_PATHS=(
   /etc/systemd/system/mediathek-importer.timer
   /etc/systemd/system/mediathek-importer-full.service
   /etc/systemd/system/mediathek-webtv.service
+  /etc/systemd/system/mediathek-stats.service
+  /etc/systemd/system/mediathek-stats.timer
   /etc/logrotate.d/mediathek-api
   /etc/apache2/mediathek-api.inc
   /etc/apache2/sites-available/mediathek-api.conf
@@ -343,7 +351,7 @@ PKGS=(build-essential pkg-config git ca-certificates openssl
       libmariadb-dev libmariadb-dev-compat mariadb-client
       libcurl4-openssl-dev liblzma-dev libexpat1-dev rapidjson-dev
       libtidy-dev libjsoncpp-dev libboost-system-dev libfcgi-dev libssl-dev
-      sassc lighttpd logrotate util-linux curl jq)
+      sassc lighttpd logrotate util-linux curl jq python3)
 is_local_db && PKGS+=(mariadb-server)
 LIGHTTPD_WAS_INSTALLED=0
 dpkg-query -W -f='${Status}' lighttpd 2>/dev/null | grep -q "install ok installed" && LIGHTTPD_WAS_INSTALLED=1
@@ -813,6 +821,57 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service
 EOF
 
+log "Statistikseite einrichten"
+# Liest das Apache-Zugriffslog der API (beide Adressen schreiben hinein) und
+# schreibt eine statische Seite ohne Scripte. IP-Adressen werden nur gezählt;
+# gespeichert werden je Tag allein Summen ($STATS_DIR/state.json).
+install -m 755 "$REPO_DIR/stats/mediathek-stats" "$API_HOME/bin/"
+cat > /etc/systemd/system/mediathek-stats.service <<EOF
+[Unit]
+Description=Statistikseite der Mediathek-API schreiben
+After=mediathek-api.service
+
+[Service]
+Type=oneshot
+User=$WEB_USER
+Group=$WEB_USER
+# Apache-Logs gehören root:adm, nur lesbar für die Gruppe adm
+SupplementaryGroups=adm
+StateDirectory=$(basename "$STATS_DIR")
+StateDirectoryMode=0755
+ExecStart=$API_HOME/bin/mediathek-stats $API_LOG http://127.0.0.1:$API_PORT/mt-api/api/info $STATS_DIR
+Nice=10
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+EOF
+
+cat > /etc/systemd/system/mediathek-stats.timer <<'EOF'
+[Unit]
+Description=Statistikseite der Mediathek-API stündlich schreiben
+
+[Timer]
+OnCalendar=*:07
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
 log "Log-Rotation für die API einrichten"
 # Ohne Rotation könnte jemand mit vielen Anfragen die Platte füllen.
 cat > /etc/logrotate.d/mediathek-api <<EOF
@@ -845,6 +904,8 @@ if [ "$APACHE" = 1 ]; then
 # Dazu die WebTV-Liste für Neutrino als statische Datei:
 #   GET  /mt-api/livestreams.xml
 ProxyPassMatch "^/mt-api/(api/(info|listChannels|listLivestream)|api\\.html)\$" "http://127.0.0.1:$API_PORT/mt-api/\$1" timeout=60 retry=5
+# Zusätzlich ins Log der Subdomain, damit die Statistik beide Adressen zählt
+CustomLog \${APACHE_LOG_DIR}/mediathek-api-access.log combined "expr=%{REQUEST_URI} =~ m#^/mt-api/#"
 Alias "/mt-api/livestreams.xml" "$WEBTV_DIR/livestreams.xml"
 <Directory "$WEBTV_DIR">
 	Options None
@@ -922,6 +983,15 @@ EOF
 		AllowOverride None
 		Require all granted
 	</Directory>
+	# Die Startseite ist die Statistik (statisch, stündlich neu geschrieben)
+	AliasMatch "^/(index\\.html)?\$" "$STATS_DIR/index.html"
+	<Directory "$STATS_DIR">
+		Options None
+		AllowOverride None
+		<Files "index.html">
+			Require all granted
+		</Files>
+	</Directory>
 	<Location "/">
 		<If "%{QUERY_STRING} != '' || (%{REQUEST_URI} == '/api.html' && %{REQUEST_METHOD} != 'POST') || (%{REQUEST_URI} =~ m#^/api/# && ! %{REQUEST_METHOD} -in {'GET','HEAD'})">
 			Require all denied
@@ -934,6 +1004,13 @@ EOF
 			Header always set Strict-Transport-Security "max-age=31536000"
 		</IfModule>
 	</Location>
+	<LocationMatch "^/(index\\.html)?\$">
+		<IfModule headers_module>
+			# Statistikseite: eigenes CSS im Dokument, sonst nichts
+			Header always set Content-Security-Policy "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'"
+			Header always set Cache-Control "max-age=300"
+		</IfModule>
+	</LocationMatch>
 </VirtualHost>
 </IfFile>
 </IfModule>
@@ -1020,6 +1097,7 @@ if [ "$HAVE_SYSTEMD" = 1 ]; then
   systemctl enable --now mediathek-api.service
   systemctl restart mediathek-api.service
   systemctl enable --now mediathek-importer.timer
+  systemctl enable --now mediathek-stats.timer
 
   # Passwort nicht auf die Kommandozeile (wäre in der Prozessliste sichtbar)
   if is_local_db; then
@@ -1060,6 +1138,10 @@ if [ "$HAVE_SYSTEMD" = 1 ]; then
   else
     warn "WebTV-Liste noch nicht geschrieben (Datenbank leer?). Das passiert nach dem nächsten erfolgreichen Import von selbst."
   fi
+  log "Statistikseite schreiben"
+  systemctl reset-failed mediathek-stats.service 2>/dev/null || true
+  systemctl start mediathek-stats.service \
+    || warn "Statistikseite nicht geschrieben. Prüfen: journalctl -u mediathek-stats"
 fi
 
 cat <<EOF
@@ -1085,6 +1167,7 @@ Apache-Dateien neu geschrieben. Wirksam nach:
   apache2ctl configtest && systemctl reload apache2
 Test:  curl https://$API_DOMAIN/api/info
 WebTV-Liste für Neutrino:  https://$API_DOMAIN/livestreams.xml
+Statistik:                 https://$API_DOMAIN/
 EOF
 elif [ -n "$API_DOMAIN" ]; then
 cat <<EOF
@@ -1121,6 +1204,7 @@ cat <<EOF
 Logs:
   Import:   journalctl -u mediathek-importer -u mediathek-importer-full
   WebTV:    journalctl -u mediathek-webtv
+  Statistik: journalctl -u mediathek-stats
   API:      $API_HOME/log/error.log und $API_HOME/log/mt-api.requests.log
   Timer:    systemctl list-timers mediathek-importer.timer
 EOF
