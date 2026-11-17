@@ -1,0 +1,29 @@
+#!/bin/bash
+# mediathek-webtv-xml <Ausgabedatei> <URL von api/listLivestream>
+#                     <Zuordnung .tsv> [<URL des XMLTV-Guides>]
+# Schreibt die Livestreams der Mediathek-API als WebTV-Liste für Neutrino,
+# mit der EPG aus dem XMLTV-Guide nach der Zuordnung (Titel -> Kanal-ID).
+# Liefert die API nichts Brauchbares, bleibt die bisherige Liste stehen.
+set -euo pipefail
+out="$1" api="$2" map="$3" xmltv="${4:-}"
+tmp="$(mktemp "$out.XXXXXX")"
+trap 'rm -f "$tmp"' EXIT
+curl -fsS --noproxy '*' -m 30 "$api" | jq -r --rawfile map "$map" --arg xmltv "$xmltv" '
+  def norm: gsub("\\s+"; " ") | ltrimstr(" ") | rtrimstr(" ");
+  ($map | split("\n") | map(select(test("^[^#]")) | split("\t")
+    | select(length > 1 and .[1] != "") | {key: (.[0] | norm), value: .[1]})
+    | from_entries) as $epg
+  | if .error != 0 or (.entry | length) == 0 then error("keine Livestreams") else . end
+  | "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+    "<webtvs name=\"Mediathek Livestreams\">",
+    (.entry[] | (.title // "" | norm) as $t
+      | select($t != "" and ((.url // "") | test("^https?://")))
+      | "\t<webtv title=\"\($t | @html)\" url=\"\(.url | @html)\""
+        + (if $xmltv != "" and $epg[$t] then " xmltv=\"\($xmltv | @html)\" epgmap=\"\($epg[$t] | @html)\"" else "" end)
+        + " description=\"Livestream\" script=\"best_bitrate_m3u8.lua\"/>"),
+    "</webtvs>"' > "$tmp"
+grep -q '<webtv ' "$tmp" || { echo "keine gültigen Livestreams in $api" >&2; exit 1; }
+# Unveränderte Liste nicht ersetzen (Datum der Datei bleibt, gut für Caches)
+cmp -s "$tmp" "$out" && exit 0
+chmod 644 "$tmp"
+mv "$tmp" "$out"

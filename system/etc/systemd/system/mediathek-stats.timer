@@ -1,0 +1,9 @@
+[Unit]
+Description=Statistikseite der Mediathek-API stündlich schreiben
+
+[Timer]
+OnCalendar=*:07
+Persistent=true
+
+[Install]
+WantedBy=timers.target

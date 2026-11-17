@@ -1,0 +1,43 @@
+[Unit]
+Description=Neutrino Mediathek API (lighttpd, nur 127.0.0.1:@API_PORT@)
+After=network.target mariadb.service
+
+[Service]
+Type=simple
+User=@WEB_USER@
+Group=@WEB_USER@
+ExecStartPre=/usr/sbin/lighttpd -tt -f /etc/mediathek-api/lighttpd.conf
+ExecStart=/usr/sbin/lighttpd -D -f /etc/mediathek-api/lighttpd.conf
+Restart=on-failure
+
+# Härtung: mt-api ist altes C++-CGI; bei einem Fehler darin soll möglichst
+# wenig erreichbar sein. Schreiben darf der Dienst nur ins Log-Verzeichnis.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=@API_HOME@/log
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+# eine Anfrage darf den Server nicht leerräumen
+MemoryMax=512M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

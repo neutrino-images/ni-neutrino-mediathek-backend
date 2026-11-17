@@ -1,0 +1,28 @@
+[Unit]
+Description=Livestreams der Mediathek als WebTV-Liste für Neutrino schreiben
+After=mediathek-api.service
+
+[Service]
+Type=oneshot
+User=@WEB_USER@
+Group=@WEB_USER@
+StateDirectory=mediathek-webtv
+StateDirectoryMode=0755
+ExecStart=@API_HOME@/bin/mediathek-webtv-xml @WEBTV_DIR@/livestreams.xml http://127.0.0.1:@API_PORT@/mt-api/api/listLivestream @API_HOME@/data/livestreams-epg.tsv @EPG_XMLTV@
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+SystemCallArchitectures=native
+SystemCallFilter=@system-service

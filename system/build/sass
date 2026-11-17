@@ -1,0 +1,11 @@
+#!/bin/sh
+style=compressed; in=; out=
+for a in "$@"; do
+  case "$a" in
+    --sourcemap=*|--default-encoding=*) ;;
+    --style=*) style="${a#*=}" ;;
+    --version) sassc --version | head -1 | awk '{print "sassc", $2}'; exit 0 ;;
+    *) if [ -z "$in" ]; then in="$a"; else out="$a"; fi ;;
+  esac
+done
+exec sassc --style "$style" "$in" "$out"

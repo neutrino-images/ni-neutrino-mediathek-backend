@@ -30,11 +30,11 @@ Ubuntu 22.04/24.04:
   `https://mt-api.neutrino-images.de/livestreams.xml`. Added as a WebTV list
   on the box, the livestreams show up as a bouquet without the plugin
 - the EPG of the livestreams from the XMLTV guide of epgshare01
-  (`EPG_XMLTV`), mapped in `webtv/livestreams-epg.tsv`; the box loads the
+  (`EPG_XMLTV`), mapped in `system/opt/mediathek/api/data/livestreams-epg.tsv`; the box loads the
   guide itself
 - a usage statistics page at `https://mt-api.neutrino-images.de/`, written
   once an hour from the Apache access log as a static page without scripts
-  (`stats/mediathek-stats`); IP addresses are only counted, per day only
+  (`system/opt/mediathek/api/bin/mediathek-stats`); IP addresses are only counted, per day only
   totals are kept
 
 Run the script as root from a checkout of this repository. Without `REF` it
@@ -85,7 +85,23 @@ sudo ./install-mediathek-backend.sh --rollback   # back to the previous version 
 else (not from a checkout), the script builds the latest state of `master`.
 
 Before running a new version of the script as root, have a look at what changed:
-`git log -p -- install-mediathek-backend.sh`
+`git log -p -- install-mediathek-backend.sh system`
+
+### Installed files
+
+Configuration files, systemd units and helper scripts are kept in `system/`,
+below their target path (`system/etc/apache2/...` becomes `/etc/apache2/...`).
+`@NAME@` in them is replaced with the value of the script variable of that
+name. Files in `system/build/` are only used for building.
+
+The script records the checksums of the files it installed in
+`/var/lib/mediathek-backend/installed.sha256`. If one of them was changed or
+deleted since, a run stops before touching anything; changes belong into
+`system/` in the repo. `FORCE=1` overwrites them anyway.
+
+```
+sudo ./install-mediathek-backend.sh --verify     # changed installed files? (exit status 1)
+```
 
 `./install-mediathek-backend.sh --help` lists all options (ports, rate limits,
 external database, ...).

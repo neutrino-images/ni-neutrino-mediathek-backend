@@ -41,6 +41,8 @@
 # Aufruf:
 #   install-mediathek-backend.sh              installieren bzw. aktualisieren
 #   install-mediathek-backend.sh --check      zeigen, ob es upstream Neues gibt
+#   install-mediathek-backend.sh --verify     prüfen, ob installierte Dateien
+#                                             verändert wurden (Rückgabe 1)
 #   install-mediathek-backend.sh --rollback   zur vorherigen Version zurück
 #                                             (nochmal aufrufen = wieder vor)
 #
@@ -73,6 +75,8 @@
 #                         EPG der Livestreams nennt (Standard: Deutschland-
 #                         Datei von epgshare01; leer = Liste ohne EPG)
 #   SKIP_FIRST_IMPORT=1   ersten Vollimport nicht automatisch starten
+#   FORCE=1               auch installieren, wenn installierte Dateien seit dem
+#                         letzten Lauf verändert wurden (siehe --verify)
 #   REF=<tag|commit>      bestimmten Stand des Repos bauen, z. B. REF=NI-2026.11
 #                         Ohne Angabe: Wird das Skript aus einem Checkout des
 #                         Repos gestartet, wird genau dessen Commit gebaut,
@@ -123,6 +127,20 @@ API_SRC="$REPO_DIR/mediathek-api-dev"
 STATE_DIR="/var/lib/mediathek-backend"
 BACKUP_DIR="$STATE_DIR/prev"
 VERSION_FILE="$STATE_DIR/installed.version"
+# Konfigurationsdateien, Units und Hilfsskripte liegen im Repo unter system/,
+# mit dem Zielpfad als Pfad darunter (system/etc/... -> /etc/...). Platzhalter
+# @NAME@ darin werden durch die gleichnamige Variable ersetzt. Die Prüfsummen
+# der installierten Dateien stehen in $MANIFEST: Ein Lauf bricht ab, wenn eine
+# davon seitdem verändert wurde (FORCE=1 überschreibt trotzdem).
+SYSTEM_DIR="$REPO_DIR/system"
+MANIFEST="$STATE_DIR/installed.sha256"
+LE_DIR="/etc/letsencrypt/live/$API_DOMAIN"
+# Neuere GCC-Versionen melden Warnungen, die das Makefile per -Werror zu
+# Fehlern macht. Diese werden hier (wie im offiziellen Dockerfile) entschärft.
+RELAX="-Wno-error=deprecated-declarations -Wno-error=unused-value -Wno-error=unused-result -Wno-error=stringop-truncation -Wno-error=ignored-qualifiers"
+TEMPLATE_VARS=(API_PORT API_HOME IMPORTER_DIR WEB_USER SVC_USER DB_HOST WEBTV_DIR
+               STATS_DIR API_LOG EPG_XMLTV API_DOMAIN ACME_ROOT LE_DIR
+               QOS_CONCURRENT QOS_PER_IP SRC_DIR RELAX)
 # Alles, was ein Update austauscht und ein Rollback zurückholt.
 # Nicht dabei (bleibt immer erhalten): Passwörter, mv2mariadb.conf, Datenbank, Logs.
 MANAGED_PATHS=(
@@ -147,6 +165,7 @@ MANAGED_PATHS=(
   /etc/apache2/sites-available/mediathek-api.conf
   /etc/apache2/conf-available/mediathek-api-qos.conf
   "$VERSION_FILE"
+  "$MANIFEST"
 )
 
 log()  { printf '\n\033[1;32m==> %s\033[0m\n' "$*"; }
@@ -221,6 +240,62 @@ copy_with_path() {
   cp -a "$1" "$dst/"
 }
 
+# Vorlage $1 aus system/ mit eingesetzten Werten auf stdout ausgeben
+render() {
+  local t v
+  t="$(cat "$1"; printf x)"; t="${t%x}"
+  for v in "${TEMPLATE_VARS[@]}"; do
+    t="${t//@$v@/"${!v}"}"      # in Anführungszeichen: & bleibt & (bash 5.2)
+  done
+  if printf '%s' "$t" | grep -q '@[A-Z][A-Z_]*@'; then
+    die "Unbekannter Platzhalter in $1: $(printf '%s' "$t" | grep -o '@[A-Z][A-Z_]*@' | sort -u | tr '\n' ' ')"
+  fi
+  printf '%s' "$t"
+}
+
+# Prüfsumme der installierten Datei $1 in $MANIFEST eintragen bzw. erneuern
+manifest_set() {
+  local tmp
+  install -d -m 755 "$STATE_DIR"
+  tmp="$(mktemp "$MANIFEST.XXXXXX")"
+  { [ -f "$MANIFEST" ] && awk -v p="$1" '$2 != p' "$MANIFEST"; sha256sum "$1"; } > "$tmp"
+  chmod 644 "$tmp"
+  mv "$tmp" "$MANIFEST"
+}
+
+# Datei aus system/ an ihren Zielpfad installieren: put_file /etc/...
+put_file() {
+  local src="$SYSTEM_DIR$1" mode=644
+  [ -f "$src" ] || die "$src fehlt im Repo."
+  case "$1" in */bin/*) mode=755 ;; esac
+  mkdir -p "$(dirname "$1")"
+  render "$src" > "$1.new"
+  chmod "$mode" "$1.new"
+  mv "$1.new" "$1"
+  manifest_set "$1"
+}
+
+# Installierte Dateien, die nicht mehr zu ihrer Prüfsumme passen (oder fehlen)
+changed_system_files() {
+  [ -f "$MANIFEST" ] || return 0
+  sha256sum --quiet -c "$MANIFEST" 2>/dev/null | sed 's/: [^:]*$//' || true
+}
+
+# Vor dem Überschreiben: Hat jemand installierte Dateien verändert?
+# $1 = Option des Laufs (für den Hinweis), z. B. --rollback
+guard_system_files() {
+  local changed
+  changed="$(changed_system_files)"
+  [ -n "$changed" ] || return 0
+  warn "Diese Dateien wurden seit der Installation verändert oder gelöscht:"
+  printf '    %s\n' $changed >&2
+  if [ "${FORCE:-0}" = 1 ]; then
+    warn "FORCE=1: Sie werden mit dem Stand aus dem Repo überschrieben."
+    return 0
+  fi
+  die "Abbruch, es wurde nichts geändert. Gewollte Änderungen gehören ins Repo (system/); überschreiben mit: sudo FORCE=1 $SELF${1:+ $1}"
+}
+
 # Laufende Version nach $BACKUP_DIR sichern (ersetzt die vorige Sicherung)
 backup_installed() {
   rm -rf "$BACKUP_DIR.new"
@@ -246,6 +321,23 @@ apache_files_differ() {  # $1 = Vergleichsverzeichnis (Sicherung)
   return 1
 }
 
+# Ergebnis der Prüfsummen ausgeben; Rückgabe 1, wenn etwas verändert ist
+report_system_files() {
+  local changed
+  if [ ! -f "$MANIFEST" ]; then
+    echo "Systemdateien: keine Prüfsummen vorhanden (noch nicht oder vor ihrer Einführung installiert)"
+    return 0
+  fi
+  changed="$(changed_system_files)"
+  if [ -z "$changed" ]; then
+    echo "Systemdateien: unverändert ($(wc -l < "$MANIFEST") Dateien geprüft)"
+    return 0
+  fi
+  echo "Systemdateien: VERÄNDERT oder gelöscht:"
+  printf '   %s\n' $changed
+  return 1
+}
+
 do_check() {
   # Installierte Version und Zusatzangaben (repo=…, script=…) getrennt
   local inst_ver="noch nicht installiert" inst_rest=""
@@ -253,6 +345,7 @@ do_check() {
     inst_ver="$(sed -n 's/.*version=\([^ ]*\).*/\1/p' "$VERSION_FILE")"
     inst_rest="$(sed 's/version=[^ ]* *//; s/ /, /g' "$VERSION_FILE")"
   fi
+  report_system_files || true
   if [ ! -d "$REPO_DIR/.git" ]; then
     printf '%-13s %s\n' "Installiert:" "$inst_ver${inst_rest:+  ($inst_rest)}"
     echo "Repo noch nicht geklont ($REPO_DIR)"; return 0
@@ -293,10 +386,15 @@ do_rollback() {
   echo "Aktuell:    $(cat "$VERSION_FILE")"
   echo "Zurück auf: $(cat "$BACKUP_DIR$VERSION_FILE")"
   importer_running && warn "Ein Import läuft gerade; er beendet sich mit der alten Programmdatei normal."
+  guard_system_files --rollback
 
   local template_changed=0 apache_changed=0 p swap="$STATE_DIR/swap"
   cmp -s "$BACKUP_DIR$IMPORTER_DIR/sql/template.sql" "$IMPORTER_DIR/sql/template.sql" || template_changed=1
   apache_files_differ "$BACKUP_DIR" && apache_changed=1
+
+  # Eine Sicherung von vor den Prüfsummen hat keine: dann gilt danach keine.
+  local drop_manifest=0
+  [ -e "$BACKUP_DIR$MANIFEST" ] || drop_manifest=1
 
   # Tauschen: aktueller Stand -> swap, Sicherung -> System, swap -> neue Sicherung.
   # So macht ein zweites --rollback den Schritt wieder rückgängig.
@@ -311,6 +409,7 @@ do_rollback() {
     cp -a "$BACKUP_DIR$p" "$(dirname "$p")/"
   done
   rm -rf "$BACKUP_DIR"; mv "$swap" "$BACKUP_DIR"
+  [ "$drop_manifest" = 0 ] || rm -f "$MANIFEST"
 
   log "Template-Datenbank mit dem zurückgeholten Stand neu anlegen"
   (cd "$IMPORTER_DIR" && runuser -u "$SVC_USER" -- ./mv2mariadb --update)
@@ -339,10 +438,13 @@ EOF
 case "${1:-}" in
   "")          ;;
   --check)     do_check; exit 0 ;;
+  --verify)    report_system_files; exit $? ;;
   --rollback)  do_rollback; exit 0 ;;
   -h|--help)   sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
-  *)           die "Unbekannte Option: $1 (erlaubt: --check, --rollback, --help)" ;;
+  *)           die "Unbekannte Option: $1 (erlaubt: --check, --verify, --rollback, --help)" ;;
 esac
+
+guard_system_files
 
 # --------------------------------------------------------------------------
 log "Pakete installieren"
@@ -411,52 +513,19 @@ BUILD_VERSION="$(build_version)"
 echo "    $BUILD_VERSION: $(as_svc git -C "$REPO_DIR" log -1 --format='%h %cs %s')"
 
 # --------------------------------------------------------------------------
-
 # sass-Wrapper: das Makefile ruft die alte Ruby-sass-Syntax auf, wir nutzen sassc
-cat > "$SRC_DIR/sass" <<'EOF'
-#!/bin/sh
-style=compressed; in=; out=
-for a in "$@"; do
-  case "$a" in
-    --sourcemap=*|--default-encoding=*) ;;
-    --style=*) style="${a#*=}" ;;
-    --version) sassc --version | head -1 | awk '{print "sassc", $2}'; exit 0 ;;
-    *) if [ -z "$in" ]; then in="$a"; else out="$a"; fi ;;
-  esac
-done
-exec sassc --style "$style" "$in" "$out"
-EOF
+render "$SYSTEM_DIR/build/sass" > "$SRC_DIR/sass"
 chmod 755 "$SRC_DIR/sass"
-
-# Neuere GCC-Versionen melden Warnungen, die das Makefile per -Werror zu
-# Fehlern macht. Diese werden hier (wie im offiziellen Dockerfile) entschärft.
-RELAX="-Wno-error=deprecated-declarations -Wno-error=unused-value -Wno-error=unused-result -Wno-error=stringop-truncation -Wno-error=ignored-qualifiers"
 
 # --------------------------------------------------------------------------
 log "Importer (mv2mariadb) bauen"
-cat > "$IMPORT_SRC/config.mk" <<EOF
-DEBUG            = 0
-ENABLE_SANITIZER = 0
-CXX              = g++
-LD               = g++
-STDC++           = -std=c++17
-EXTRA_CXXFLAGS   = -DPRIV_USERAGENT $RELAX
-EOF
+render "$SYSTEM_DIR/build/mediathek-db-import.config.mk" > "$IMPORT_SRC/config.mk"
 chown "$SVC_USER:" "$IMPORT_SRC/config.mk"
 as_svc make -C "$IMPORT_SRC" clean >/dev/null
 as_svc make -C "$IMPORT_SRC" -j"$(nproc)" IMPORTER_VERSION="$BUILD_VERSION"
 
 log "API (mt-api) bauen"
-cat > "$API_SRC/config.mk" <<EOF
-DEBUG            = 0
-ENABLE_SANITIZER = 0
-CXX              = g++
-LD               = g++
-STDC++           = -std=c++14
-SASS             = $SRC_DIR/sass
-EXTRA_INCLUDES   = -I/usr/include/jsoncpp
-EXTRA_CXXFLAGS   = $RELAX
-EOF
+render "$SYSTEM_DIR/build/mediathek-api-dev.config.mk" > "$API_SRC/config.mk"
 chown "$SVC_USER:" "$API_SRC/config.mk"
 as_svc make -C "$API_SRC" clean >/dev/null
 as_svc make -C "$API_SRC" -j"$(nproc)" MT_API_VERSION="$BUILD_VERSION"
@@ -520,27 +589,9 @@ if [ ! -f "$CONF" ]; then
   # mv2mariadb ergänzt fehlende Schlüssel selbst. Der Download-Server ist
   # direkt eingetragen, falls die Serverliste beim ersten Lauf nicht erreichbar ist.
   # WICHTIG: testMode=false, sonst landen die Daten in mediathek_1_TEST.
-  cat > "$CONF" <<EOF
-aktFileName=Filmliste-akt.xz
-diffFileName=Filmliste-diff.xz
-downloadServerCount=1
-downloadServer_01=https://liste.mediathekview.de/Filmliste-akt.xz
-downloadServerConnectFailsMax=3
-downloadServerConnectFail_01=0
-serverListUrl=https://res.mediathekview.de/akt.xml
-serverListRefreshDays=1
-mysqlHost=$DB_HOST
-passwordFile=pw_mariadb
-testMode=false
-testLabel=_TEST
-videoDb=mediathek_1
-videoDbBaseName=mediathek_1
-videoDbTemplate=mediathek_1_template
-videoDbTmp1=mediathek_1_tmp1
-videoDb_TableInfo=channelinfo
-videoDb_TableVersion=version
-videoDb_TableVideo=video
-EOF
+  # Nur Startwert: mv2mariadb schreibt die Datei selbst fort, deshalb ohne
+  # Prüfsumme.
+  render "$SYSTEM_DIR$CONF" > "$CONF"
 else
   sed -i "s/^mysqlHost=.*/mysqlHost=$DB_HOST/; s/^testMode=.*/testMode=false/" "$CONF"
 fi
@@ -585,164 +636,21 @@ chown "$WEB_USER:$WEB_USER" "$API_HOME/data/.passwd/sqlpasswd"
 chmod 600 "$API_HOME/data/.passwd/sqlpasswd"
 
 log "lighttpd-Konfiguration für die API schreiben"
-install -d /etc/mediathek-api
-cat > /etc/mediathek-api/lighttpd.conf <<EOF
-# Eigene lighttpd-Instanz nur für die Mediathek-API.
-# Lauscht nur lokal; von außen erreichbar ausschließlich über Apache.
-# Läuft direkt als Benutzer $WEB_USER (per systemd), daher kein server.username.
-server.modules = ( "mod_access", "mod_alias", "mod_redirect", "mod_accesslog",
-                   "mod_rewrite", "mod_cgi", "mod_setenv" )
-
-server.bind          = "127.0.0.1"
-server.port          = $API_PORT
-server.document-root = "$API_HOME/www"
-server.errorlog      = "$API_HOME/log/error.log"
-accesslog.filename   = "$API_HOME/log/access.log"
-server.tag           = "mt-api"
-# POST-Daten des Plugins sind klein (die API selbst liest höchstens 32 KB)
-server.max-request-size = 64
-mimetype.assign = ( ".css" => "text/css", ".js" => "application/javascript",
-                    ".gif" => "image/gif", ".ico" => "image/x-icon",
-                    ".html" => "text/html" )
-
-alias.url = (
-  "/mt-api/api.html" => "$API_HOME/www/mt-api.cgi",
-  "/mt-api/api"      => "$API_HOME/www/mt-api.cgi",
-  "/mt-api"          => "$API_HOME/www/mt-api.cgi",
-  "/css"             => "$API_HOME/www/css",
-  "/web"             => "$API_HOME/www/web"
-)
-
-setenv.add-environment = (
-  "LC_ALL"         => "C.UTF-8",
-  "LANG"           => "C.UTF-8",
-  "MT_API_DB_HOST" => "$DB_HOST"
-)
-# mt-api schaltet anhand von SERVER_NAME in einen Debug-Modus (HTML-Ausgabe,
-# SQL-Abfragen, Fehlertexte). SERVER_NAME kommt sonst aus dem Host-Header des
-# Clients; hier fest setzen, damit sich das von außen nicht auslösen lässt.
-setenv.set-environment = (
-  "SERVER_NAME"    => "mt-api.local"
-)
-
-url.rewrite-if-not-file = (
-  "^/api\\.html\$" => "/mt-api?mode=api",
-  "^/api/(info|listChannels|listLivestream)\$" => "/mt-api?mode=api&sub=\$1",
-  "^/api\$" => "/mt-api?mode=api"
-)
-
-\$HTTP["url"] == "/" { url.redirect = ( "" => "/mt-api" ) }
-
-cgi.assign = ( ".cgi" => "/bin/sh" )
-EOF
+put_file /etc/mediathek-api/lighttpd.conf
 lighttpd -tt -f /etc/mediathek-api/lighttpd.conf >/dev/null
 
 # --------------------------------------------------------------------------
 log "systemd-Units schreiben"
-cat > /etc/systemd/system/mediathek-api.service <<EOF
-[Unit]
-Description=Neutrino Mediathek API (lighttpd, nur 127.0.0.1:$API_PORT)
-After=network.target mariadb.service
-
-[Service]
-Type=simple
-User=$WEB_USER
-Group=$WEB_USER
-ExecStartPre=/usr/sbin/lighttpd -tt -f /etc/mediathek-api/lighttpd.conf
-ExecStart=/usr/sbin/lighttpd -D -f /etc/mediathek-api/lighttpd.conf
-Restart=on-failure
-
-# Härtung: mt-api ist altes C++-CGI; bei einem Fehler darin soll möglichst
-# wenig erreichbar sein. Schreiben darf der Dienst nur ins Log-Verzeichnis.
-NoNewPrivileges=yes
-ProtectSystem=strict
-ReadWritePaths=$API_HOME/log
-ProtectHome=yes
-PrivateTmp=yes
-PrivateDevices=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectKernelLogs=yes
-ProtectControlGroups=yes
-ProtectClock=yes
-ProtectHostname=yes
-RestrictNamespaces=yes
-RestrictRealtime=yes
-RestrictSUIDSGID=yes
-LockPersonality=yes
-MemoryDenyWriteExecute=yes
-CapabilityBoundingSet=
-AmbientCapabilities=
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-SystemCallArchitectures=native
-SystemCallFilter=@system-service
-SystemCallFilter=~@privileged @resources
-# eine Anfrage darf den Server nicht leerräumen
-MemoryMax=512M
-TasksMax=64
-
-[Install]
-WantedBy=multi-user.target
-EOF
+put_file /etc/systemd/system/mediathek-api.service
 
 # Zwei Importer-Units mit derselben Härtung: der stündliche Lauf und der
 # Vollimport. Eine Sperrdatei verhindert, dass beide gleichzeitig laufen:
-# der stündliche Lauf überspringt dann, der Vollimport wartet.
-# Nach jedem erfolgreichen Lauf wird die WebTV-Liste neu geschrieben.
-write_importer_unit() {  # $1 = Unit-Datei, $2 = Beschreibung, $3 = flock-Optionen, $4 = Argumente
-cat > "/etc/systemd/system/$1" <<EOF
-[Unit]
-Description=$2
-After=network-online.target mariadb.service
-Wants=network-online.target
-OnSuccess=mediathek-webtv.service
-
-[Service]
-Type=oneshot
-User=$SVC_USER
-Group=$SVC_USER
-WorkingDirectory=$IMPORTER_DIR
-ExecStart=/usr/bin/flock $3 $IMPORTER_DIR/.import.lock $IMPORTER_DIR/mv2mariadb $4
-Nice=10
-IOSchedulingClass=idle
-
-NoNewPrivileges=yes
-ProtectSystem=strict
-ReadWritePaths=$IMPORTER_DIR
-ProtectHome=yes
-PrivateTmp=yes
-PrivateDevices=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectControlGroups=yes
-RestrictSUIDSGID=yes
-LockPersonality=yes
-CapabilityBoundingSet=
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-SystemCallArchitectures=native
-SystemCallFilter=@system-service
-EOF
-}
-# Sperre 120 min nach dem letzten Download; der Timer ruft stündlich auf.
-write_importer_unit mediathek-importer.service \
-  "MediathekView-Filmliste nach MariaDB importieren (mv2mariadb)" \
-  "-n -E 0" "--cron-mode 120 --cron-mode-echo"
-write_importer_unit mediathek-importer-full.service \
-  "MediathekView-Filmliste vollständig neu importieren (mv2mariadb --force-convert)" \
-  "" "--force-convert"
-
-cat > /etc/systemd/system/mediathek-importer.timer <<'EOF'
-[Unit]
-Description=Stündlicher Mediathek-Import
-
-[Timer]
-OnCalendar=hourly
-RandomizedDelaySec=10min
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF
+# der stündliche Lauf überspringt dann, der Vollimport wartet. Sperre 120 min
+# nach dem letzten Download; der Timer ruft stündlich auf. Nach jedem
+# erfolgreichen Lauf wird die WebTV-Liste neu geschrieben.
+put_file /etc/systemd/system/mediathek-importer.service
+put_file /etc/systemd/system/mediathek-importer-full.service
+put_file /etc/systemd/system/mediathek-importer.timer
 
 log "WebTV-Liste der Livestreams einrichten"
 # Neutrino lädt WebTV-Listen auch von einer URL. Diese Liste enthält die
@@ -752,285 +660,39 @@ log "WebTV-Liste der Livestreams einrichten"
 # als statische Datei ausgeliefert. Das Skript best_bitrate_m3u8.lua gehört
 # zu jedem NI-Image und wählt die Auflösung nach der Einstellung der Box.
 # Für die EPG nennt jeder Eintrag den XMLTV-Guide (EPG_XMLTV) und seinen
-# Kanal darin, nach webtv/livestreams-epg.tsv im Repo. Den Guide lädt die
-# Box selbst; der Server holt ihn nicht.
-cat > "$API_HOME/bin/mediathek-webtv-xml" <<'EOF'
-#!/bin/bash
-# mediathek-webtv-xml <Ausgabedatei> <URL von api/listLivestream>
-#                     <Zuordnung .tsv> [<URL des XMLTV-Guides>]
-# Schreibt die Livestreams der Mediathek-API als WebTV-Liste für Neutrino,
-# mit der EPG aus dem XMLTV-Guide nach der Zuordnung (Titel -> Kanal-ID).
-# Liefert die API nichts Brauchbares, bleibt die bisherige Liste stehen.
-set -euo pipefail
-out="$1" api="$2" map="$3" xmltv="${4:-}"
-tmp="$(mktemp "$out.XXXXXX")"
-trap 'rm -f "$tmp"' EXIT
-curl -fsS --noproxy '*' -m 30 "$api" | jq -r --rawfile map "$map" --arg xmltv "$xmltv" '
-  def norm: gsub("\\s+"; " ") | ltrimstr(" ") | rtrimstr(" ");
-  ($map | split("\n") | map(select(test("^[^#]")) | split("\t")
-    | select(length > 1 and .[1] != "") | {key: (.[0] | norm), value: .[1]})
-    | from_entries) as $epg
-  | if .error != 0 or (.entry | length) == 0 then error("keine Livestreams") else . end
-  | "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
-    "<webtvs name=\"Mediathek Livestreams\">",
-    (.entry[] | (.title // "" | norm) as $t
-      | select($t != "" and ((.url // "") | test("^https?://")))
-      | "\t<webtv title=\"\($t | @html)\" url=\"\(.url | @html)\""
-        + (if $xmltv != "" and $epg[$t] then " xmltv=\"\($xmltv | @html)\" epgmap=\"\($epg[$t] | @html)\"" else "" end)
-        + " description=\"Livestream\" script=\"best_bitrate_m3u8.lua\"/>"),
-    "</webtvs>"' > "$tmp"
-grep -q '<webtv ' "$tmp" || { echo "keine gültigen Livestreams in $api" >&2; exit 1; }
-# Unveränderte Liste nicht ersetzen (Datum der Datei bleibt, gut für Caches)
-cmp -s "$tmp" "$out" && exit 0
-chmod 644 "$tmp"
-mv "$tmp" "$out"
-EOF
-chmod 755 "$API_HOME/bin/mediathek-webtv-xml"
-install -m 644 "$REPO_DIR/webtv/livestreams-epg.tsv" "$API_HOME/data/"
+# Kanal darin, nach livestreams-epg.tsv. Den Guide lädt die Box selbst; der
+# Server holt ihn nicht.
+put_file /opt/mediathek/api/bin/mediathek-webtv-xml
+put_file /opt/mediathek/api/data/livestreams-epg.tsv
 
 # Läuft nach jedem erfolgreichen Import (OnSuccess= der Importer-Units) und
 # darf nur die lokale API erreichen und nur in $WEBTV_DIR schreiben.
-cat > /etc/systemd/system/mediathek-webtv.service <<EOF
-[Unit]
-Description=Livestreams der Mediathek als WebTV-Liste für Neutrino schreiben
-After=mediathek-api.service
-
-[Service]
-Type=oneshot
-User=$WEB_USER
-Group=$WEB_USER
-StateDirectory=$(basename "$WEBTV_DIR")
-StateDirectoryMode=0755
-ExecStart=$API_HOME/bin/mediathek-webtv-xml $WEBTV_DIR/livestreams.xml http://127.0.0.1:$API_PORT/mt-api/api/listLivestream $API_HOME/data/livestreams-epg.tsv $EPG_XMLTV
-
-NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=yes
-PrivateTmp=yes
-PrivateDevices=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectControlGroups=yes
-RestrictSUIDSGID=yes
-LockPersonality=yes
-CapabilityBoundingSet=
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-IPAddressDeny=any
-IPAddressAllow=localhost
-SystemCallArchitectures=native
-SystemCallFilter=@system-service
-EOF
+put_file /etc/systemd/system/mediathek-webtv.service
 
 log "Statistikseite einrichten"
 # Liest das Apache-Zugriffslog der API (beide Adressen schreiben hinein) und
 # schreibt eine statische Seite ohne Scripte. IP-Adressen werden nur gezählt;
 # gespeichert werden je Tag allein Summen ($STATS_DIR/state.json).
-install -m 755 "$REPO_DIR/stats/mediathek-stats" "$API_HOME/bin/"
-cat > /etc/systemd/system/mediathek-stats.service <<EOF
-[Unit]
-Description=Statistikseite der Mediathek-API schreiben
-After=mediathek-api.service
-
-[Service]
-Type=oneshot
-User=$WEB_USER
-Group=$WEB_USER
-# Apache-Logs gehören root:adm, nur lesbar für die Gruppe adm
-SupplementaryGroups=adm
-StateDirectory=$(basename "$STATS_DIR")
-StateDirectoryMode=0755
-ExecStart=$API_HOME/bin/mediathek-stats $API_LOG http://127.0.0.1:$API_PORT/mt-api/api/info $STATS_DIR
-Nice=10
-
-NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=yes
-PrivateTmp=yes
-PrivateDevices=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectControlGroups=yes
-RestrictSUIDSGID=yes
-LockPersonality=yes
-CapabilityBoundingSet=
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-IPAddressDeny=any
-IPAddressAllow=localhost
-SystemCallArchitectures=native
-SystemCallFilter=@system-service
-EOF
-
-cat > /etc/systemd/system/mediathek-stats.timer <<'EOF'
-[Unit]
-Description=Statistikseite der Mediathek-API stündlich schreiben
-
-[Timer]
-OnCalendar=*:07
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF
+put_file /opt/mediathek/api/bin/mediathek-stats
+put_file /etc/systemd/system/mediathek-stats.service
+put_file /etc/systemd/system/mediathek-stats.timer
 
 log "Log-Rotation für die API einrichten"
 # Ohne Rotation könnte jemand mit vielen Anfragen die Platte füllen.
-cat > /etc/logrotate.d/mediathek-api <<EOF
-$API_HOME/log/*.log {
-	su $WEB_USER $WEB_USER
-	daily
-	rotate 14
-	maxsize 50M
-	compress
-	delaycompress
-	missingok
-	notifempty
-	copytruncate
-}
-EOF
+put_file /etc/logrotate.d/mediathek-api
 
 # --------------------------------------------------------------------------
 if [ "$APACHE" = 1 ]; then
   log "Apache-Anbindung vorbereiten (VirtualHost wird nicht verändert)"
-  cat > /etc/apache2/mediathek-api.inc <<EOF
-# Neutrino Mediathek API -> lokale lighttpd-Instanz (127.0.0.1:$API_PORT)
-# In den HTTPS-VirtualHost einbinden:
-#   Include /etc/apache2/mediathek-api.inc
-# Freigegeben wird genau das, was das Plugin benutzt
-# (Basis-URL im Plugin: https://<domain>/mt-api):
-#   GET  /mt-api/api/info, /mt-api/api/listChannels, /mt-api/api/listLivestream
-#   POST /mt-api/api.html (Suchanfragen)
-# Das Plugin schickt nie URL-Parameter. Alles andere wird abgewiesen, darunter
-# die HTML-Start- und Fehlerseiten der API.
-# Dazu die WebTV-Liste für Neutrino als statische Datei:
-#   GET  /mt-api/livestreams.xml
-ProxyPassMatch "^/mt-api/(api/(info|listChannels|listLivestream)|api\\.html)\$" "http://127.0.0.1:$API_PORT/mt-api/\$1" timeout=60 retry=5
-# Zusätzlich ins Log der Subdomain, damit die Statistik beide Adressen zählt
-CustomLog \${APACHE_LOG_DIR}/mediathek-api-access.log combined "expr=%{REQUEST_URI} =~ m#^/mt-api/#"
-Alias "/mt-api/livestreams.xml" "$WEBTV_DIR/livestreams.xml"
-<Directory "$WEBTV_DIR">
-	Options None
-	AllowOverride None
-	Require all granted
-</Directory>
-
-<LocationMatch "^/mt-api/">
-	<If "%{QUERY_STRING} != '' || (%{REQUEST_URI} == '/mt-api/api.html' && %{REQUEST_METHOD} != 'POST') || (%{REQUEST_URI} =~ m#^/mt-api/api/# && ! %{REQUEST_METHOD} -in {'GET','HEAD'})">
-		Require all denied
-	</If>
-	<IfModule headers_module>
-		# Antworten sind JSON: nie als HTML deuten, keine Scripte, nicht einbetten
-		Header always set X-Content-Type-Options "nosniff"
-		Header always set Content-Security-Policy "default-src 'none'; frame-ancestors 'none'"
-		Header always set Referrer-Policy "no-referrer"
-	</IfModule>
-</LocationMatch>
-EOF
+  put_file /etc/apache2/mediathek-api.inc
 
   if [ -n "$API_DOMAIN" ]; then
-    LE_DIR="/etc/letsencrypt/live/$API_DOMAIN"
     install -d -m 755 "$ACME_ROOT"
-    cat > /etc/apache2/sites-available/mediathek-api.conf <<EOF
-# Eigene Subdomain für die Mediathek-API: https://$API_DOMAIN
-# (Basis-URL im Plugin, ohne /mt-api)
-#
-# Port 80:  liefert nur die Let's-Encrypt-Prüfdateien aus $ACME_ROOT,
-#           alles andere wird auf HTTPS umgeleitet.
-# Port 443: wird erst aktiv, wenn das Zertifikat unter $LE_DIR liegt.
-#           Ausstellen: certbot certonly --webroot -w $ACME_ROOT -d $API_DOMAIN
-#           --deploy-hook "systemctl reload apache2"
-<VirtualHost *:80>
-	ServerName $API_DOMAIN
-	DocumentRoot $ACME_ROOT
-	<Directory $ACME_ROOT>
-		Options None
-		AllowOverride None
-		Require all granted
-	</Directory>
-	RedirectMatch permanent "^/(?!\.well-known/acme-challenge/)(.*)\$" "https://$API_DOMAIN/\$1"
-	ErrorLog \${APACHE_LOG_DIR}/mediathek-api-error.log
-	CustomLog \${APACHE_LOG_DIR}/mediathek-api-access.log combined
-</VirtualHost>
-
-<IfModule ssl_module>
-<IfFile $LE_DIR/fullchain.pem>
-<VirtualHost *:443>
-	ServerName $API_DOMAIN
-	DocumentRoot $ACME_ROOT
-	<Directory $ACME_ROOT>
-		Options None
-		AllowOverride None
-		Require all granted
-	</Directory>
-	SSLEngine on
-	SSLCertificateFile $LE_DIR/fullchain.pem
-	SSLCertificateKeyFile $LE_DIR/privkey.pem
-	<IfFile /etc/letsencrypt/options-ssl-apache.conf>
-		Include /etc/letsencrypt/options-ssl-apache.conf
-	</IfFile>
-	ErrorLog \${APACHE_LOG_DIR}/mediathek-api-error.log
-	CustomLog \${APACHE_LOG_DIR}/mediathek-api-access.log combined
-
-	# Freigegeben wird genau das, was das Plugin benutzt:
-	#   GET  /api/info, /api/listChannels, /api/listLivestream
-	#   POST /api.html (Suchanfragen)
-	# Das Plugin schickt nie URL-Parameter. Alles andere wird abgewiesen.
-	# Dazu die WebTV-Liste für Neutrino als statische Datei:
-	#   GET  /livestreams.xml
-	ProxyPassMatch "^/(api/(info|listChannels|listLivestream)|api\\.html)\$" "http://127.0.0.1:$API_PORT/mt-api/\$1" timeout=60 retry=5
-	Alias "/livestreams.xml" "$WEBTV_DIR/livestreams.xml"
-	<Directory "$WEBTV_DIR">
-		Options None
-		AllowOverride None
-		Require all granted
-	</Directory>
-	# Die Startseite ist die Statistik (statisch, stündlich neu geschrieben)
-	AliasMatch "^/(index\\.html)?\$" "$STATS_DIR/index.html"
-	<Directory "$STATS_DIR">
-		Options None
-		AllowOverride None
-		<Files "index.html">
-			Require all granted
-		</Files>
-	</Directory>
-	<Location "/">
-		<If "%{QUERY_STRING} != '' || (%{REQUEST_URI} == '/api.html' && %{REQUEST_METHOD} != 'POST') || (%{REQUEST_URI} =~ m#^/api/# && ! %{REQUEST_METHOD} -in {'GET','HEAD'})">
-			Require all denied
-		</If>
-		<IfModule headers_module>
-			# Antworten sind JSON: nie als HTML deuten, keine Scripte, nicht einbetten
-			Header always set X-Content-Type-Options "nosniff"
-			Header always set Content-Security-Policy "default-src 'none'; frame-ancestors 'none'"
-			Header always set Referrer-Policy "no-referrer"
-			Header always set Strict-Transport-Security "max-age=31536000"
-		</IfModule>
-	</Location>
-	<LocationMatch "^/(index\\.html)?\$">
-		<IfModule headers_module>
-			# Statistikseite: eigenes CSS im Dokument, sonst nichts
-			Header always set Content-Security-Policy "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'"
-			Header always set Cache-Control "max-age=300"
-		</IfModule>
-	</LocationMatch>
-</VirtualHost>
-</IfFile>
-</IfModule>
-EOF
+    put_file /etc/apache2/sites-available/mediathek-api.conf
   fi
 
-  cat > /etc/apache2/conf-available/mediathek-api-qos.conf <<EOF
-# Begrenzung für die Mediathek-API (mod_qos)
-<IfModule qos_module>
-	# API-Anfragen über /mt-api/ der Hauptseite und über die eigene Subdomain
-	# höchstens $QOS_CONCURRENT gleichzeitige API-Anfragen auf dem ganzen Server
-	QS_LocRequestLimitMatch "^/(mt-api/)?api(/(info|listChannels|listLivestream)|\\.html)\$" $QOS_CONCURRENT
-	# pro IP höchstens $QOS_PER_IP API-Anfragen in 60 Sekunden.
-	# Achtung: Wer das überschreitet, wird von mod_qos für den Rest der
-	# 60 Sekunden für den ganzen Server gesperrt (HTTP 429), nicht nur für die API.
-	SetEnvIf Request_URI "^/(mt-api/)?api(/(info|listChannels|listLivestream)|\\.html)\$" QS_MTAPI=1
-	QS_ClientEventLimitCount $QOS_PER_IP 60 QS_MTAPI
-	QS_ErrorResponseCode 429
-</IfModule>
-EOF
+  put_file /etc/apache2/conf-available/mediathek-api-qos.conf
+
   # Apache nur anfassen, wenn seine Konfiguration vorher in Ordnung ist
   if ! apache2ctl configtest >/dev/null 2>&1; then
     apache2ctl configtest || true
