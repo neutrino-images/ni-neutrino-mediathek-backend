@@ -8,7 +8,7 @@ set -euo pipefail
 out="$1" api="$2" map="$3" xmltv="${4:-}"
 tmp="$(mktemp "$out.XXXXXX")"
 trap 'rm -f "$tmp"' EXIT
-curl -fsS --noproxy '*' -m 30 "$api" | jq -r --rawfile map "$map" --arg xmltv "$xmltv" '
+curl -fsS --noproxy '*' -m 120 "$api" | jq -r --rawfile map "$map" --arg xmltv "$xmltv" '
   def norm: gsub("\\s+"; " ") | ltrimstr(" ") | rtrimstr(" ");
   ($map | split("\n") | map(select(test("^[^#]")) | split("\t")
     | select(length > 1 and .[1] != "") | {key: (.[0] | norm), value: .[1]})

@@ -191,7 +191,12 @@ install_mod_qos() {
   local codename=""
   [ -r /etc/os-release ] && codename="$(. /etc/os-release && echo "${VERSION_CODENAME:-}")"
   if [ "$codename" = bookworm ]; then
-    if apt-cache policy libapache2-mod-qos | grep -q 'bookworm-backports'; then
+    # Erst ganz lesen, dann suchen: grep -q beendet sich beim ersten Treffer,
+    # apt-cache bekommt beim Weiterschreiben SIGPIPE, und mit pipefail galt
+    # das als "keine Backports".
+    local policy
+    policy="$(apt-cache policy libapache2-mod-qos)"
+    if grep -q 'bookworm-backports' <<< "$policy"; then
       apt-get install -y -qq --no-install-recommends -t bookworm-backports libapache2-mod-qos >/dev/null
     else
       warn "Debian 12: libapache2-mod-qos aus bookworm ist defekt, die funktionierende Version liegt in bookworm-backports – die sind hier nicht eingerichtet."
@@ -247,8 +252,8 @@ render() {
   for v in "${TEMPLATE_VARS[@]}"; do
     t="${t//@$v@/"${!v}"}"      # in Anführungszeichen: & bleibt & (bash 5.2)
   done
-  if printf '%s' "$t" | grep -q '@[A-Z][A-Z_]*@'; then
-    die "Unbekannter Platzhalter in $1: $(printf '%s' "$t" | grep -o '@[A-Z][A-Z_]*@' | sort -u | tr '\n' ' ')"
+  if grep -q '@[A-Z][A-Z_]*@' <<< "$t"; then
+    die "Unbekannter Platzhalter in $1: $(grep -o '@[A-Z][A-Z_]*@' <<< "$t" | sort -u | tr '\n' ' ')"
   fi
   printf '%s' "$t"
 }
@@ -456,7 +461,7 @@ PKGS=(build-essential pkg-config git ca-certificates openssl
       sassc lighttpd logrotate util-linux curl jq python3)
 is_local_db && PKGS+=(mariadb-server)
 LIGHTTPD_WAS_INSTALLED=0
-dpkg-query -W -f='${Status}' lighttpd 2>/dev/null | grep -q "install ok installed" && LIGHTTPD_WAS_INSTALLED=1
+[ "$(dpkg-query -W -f='${Status}' lighttpd 2>/dev/null || true)" = "install ok installed" ] && LIGHTTPD_WAS_INSTALLED=1
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends "${PKGS[@]}" >/dev/null
 
@@ -551,6 +556,14 @@ if [ -x "$API_HOME/bin/mt-api" ]; then
 fi
 
 # --------------------------------------------------------------------------
+# Ein laufender Import hält Tabellen von mediathek_1 in einer Transaktion.
+# Wer dann die Tabellen anfasst, wartet, und hinter ihm warten alle Abfragen
+# der API. Deshalb erst das Ende des Imports abwarten.
+if importer_running; then
+  log "Warte auf den laufenden Import (journalctl -fu mediathek-importer)"
+  while importer_running; do sleep 10; done
+fi
+
 log "Datenbank vorbereiten"
 IMPORT_PW="${IMPORT_PW:-$(pw_from_file "$IMPORTER_DIR/pw_mariadb")}"
 API_PW="${API_PW:-$(pw_from_file "$API_HOME/data/.passwd/sqlpasswd")}"
@@ -605,8 +618,12 @@ log "Template-Datenbank anlegen (mv2mariadb --update)"
 if is_local_db; then
   # Wie im mediathek-backend: leere Tabellen in mediathek_1 aus dem Template,
   # damit die API schon vor dem ersten Import gültig (leer) antwortet.
-  # Vorhandene Tabellen und Daten bleiben unberührt.
-  mariadb <<'EOF'
+  # Vorhandene Tabellen und Daten bleiben unberührt. Sind alle schon da, wird
+  # mediathek_1 gar nicht angefasst: Auch CREATE TABLE IF NOT EXISTS braucht
+  # eine exklusive Sperre auf den Namen und stünde einem Import im Weg.
+  HAVE_TABLES="$(mariadb -N -B -e "SELECT COUNT(*) FROM information_schema.tables
+    WHERE table_schema='mediathek_1' AND table_name IN ('video','channelinfo','version')")"
+  [ "$HAVE_TABLES" = 3 ] || mariadb <<'EOF'
 CREATE DATABASE IF NOT EXISTS mediathek_1 DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 CREATE TABLE IF NOT EXISTS mediathek_1.video       LIKE mediathek_1_template.video;
 CREATE TABLE IF NOT EXISTS mediathek_1.channelinfo LIKE mediathek_1_template.channelinfo;
@@ -781,7 +798,7 @@ fi
 log "Funktionstest der API"
 SMOKE_OK=0
 for _ in $(seq 15); do
-  if curl -fsS --noproxy '*' -m 5 "http://127.0.0.1:$API_PORT/mt-api/api/info" 2>/dev/null | grep -q '"api":"mt-api"'; then
+  if grep -q '"api":"mt-api"' <<< "$(curl -fsS --noproxy '*' -m 5 "http://127.0.0.1:$API_PORT/mt-api/api/info" 2>/dev/null || true)"; then
     SMOKE_OK=1; break
   fi
   sleep 1
