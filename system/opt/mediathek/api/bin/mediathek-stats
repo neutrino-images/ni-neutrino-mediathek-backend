@@ -175,9 +175,10 @@ def bar_path(cls, x, base, bh, bw, round_top):
         cls, x, base, -(bh - r), r, r, r, r, bw - 2 * r, r, r, r, r, bh - r)
 
 
-def bar_chart(values, labels, tips, label_every, title, live=None):
+def bar_chart(values, labels, tips, label_every, title, live=None, cls="bar other"):
     """Säulen mit Grundlinie und Tooltip. Mit live: unten der Anteil der
-    Livestreams in Orange, darüber der Rest in Grau, 2px Lücke dazwischen."""
+    Livestreams in Orange, darüber der Rest in Grau, 2px Lücke dazwischen.
+    Ohne live eine Reihe in cls; Orange bleibt den Livestreams vorbehalten."""
     w, h, left, right, top, bottom = 1000, 270, 56, 8, 14, 30
     pw, ph = w - left - right, h - top - bottom
     top_v = nice_max(max(values) if values else 0)
@@ -202,7 +203,7 @@ def bar_chart(values, labels, tips, label_every, title, live=None):
         bh = ph * v / top_v if top_v else 0
         hl.append('<rect class="hl l%d" x="%.1f" y="%d" width="%.1f" height="%d"/>' % (i, left + band * i, top, band, ph))
         if live is None:
-            bars.append(bar_path("bar", x, base, bh, bw, True))
+            bars.append(bar_path(cls, x, base, bh, bw, True))
         else:
             lv = min(live[i], v)
             lh = ph * lv / top_v if top_v else 0
@@ -297,7 +298,7 @@ def render(state, ips, info, now):
     ]
     chart_html = "".join(
         '<section class="card"><h2>%s</h2><p class="sub">%s</p>%s%s%s</section>' % (
-            a, b, LEGEND if "bar other" in c else "", c, daily_html if a == "Anfragen pro Tag" else "")
+            a, b, LEGEND if '<path class="bar"' in c or '<rect class="bar"' in c else "", c, daily_html if a == "Anfragen pro Tag" else "")
         for a, b, c in charts)
     kpi_html = "".join(
         '<div class="kpi"><div class="label">%s</div><div class="value">%s</div><div class="sub">%s</div></div>' % k for k in kpis)
