@@ -309,6 +309,7 @@ def render(state, ips, info, now):
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Mediathek-API · Nutzung</title>
+<link rel="icon" href="https://www.neutrino-images.de/favicon.ico">
 <style>
 /* Neutrino-Images · Statistikseiten (Designsystem Neutrino-Images) */
 :root {
