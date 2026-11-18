@@ -32,7 +32,8 @@ Ubuntu 22.04/24.04:
 - the EPG of the livestreams from the XMLTV guide of epgshare01
   (`EPG_XMLTV`), mapped in `system/opt/mediathek/api/data/livestreams-epg.tsv`; the box loads the
   guide itself
-- a usage statistics page at `https://mt-api.neutrino-images.de/`, written
+- a usage statistics page at `https://mt-api.neutrino-images.de/stats/`
+  (the bare address redirects there), written
   once an hour from the Apache access log as a static page without scripts
   (`system/opt/mediathek/api/bin/mediathek-stats`); IP addresses are only counted, per day only
   totals are kept

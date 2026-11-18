@@ -35,7 +35,7 @@
 # Die EPG dazu holt die Box selbst aus dem XMLTV-Guide von epgshare01.
 #
 # Stündlich schreibt mediathek-stats.timer aus dem Apache-Zugriffslog eine
-# statische Statistikseite: https://mt-api.neutrino-images.de/
+# statische Statistikseite: https://mt-api.neutrino-images.de/stats/
 #
 # Ziel: Debian 12/13, Ubuntu 22.04/24.04. Als root ausführen.
 # Aufruf:
@@ -846,7 +846,7 @@ Apache-Dateien neu geschrieben. Wirksam nach:
   apache2ctl configtest && systemctl reload apache2
 Test:  curl https://$API_DOMAIN/api/info
 WebTV-Liste für Neutrino:  https://$API_DOMAIN/livestreams.xml
-Statistik:                 https://$API_DOMAIN/
+Statistik:                 https://$API_DOMAIN/stats/
 EOF
 elif [ -n "$API_DOMAIN" ]; then
 cat <<EOF
